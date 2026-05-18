@@ -25,13 +25,10 @@ export async function processRecordingUrl(
   }
 
   const tenantId = process.env["AZURE_TENANT_ID"];
-  const clientId = process.env["AZURE_CLIENT_ID"];
-  if (!tenantId || !clientId) {
-    throw new Error("AZURE_TENANT_ID and AZURE_CLIENT_ID env vars required for SharePoint access");
-  }
+  const clientId = process.env["AZURE_CLIENT_ID"]; // optional
 
   console.error("Authenticating with Microsoft Graph...");
-  const token = await getGraphToken(tenantId, clientId);
+  const token = await getGraphToken(tenantId, clientId ?? undefined);
 
   // Download to temp dir
   const tempDir = path.join(os.tmpdir(), `mcp-rec-${id}`);
