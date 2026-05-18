@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { processRecordingUrl, processRecordingFolder, injectTranscriptAndReanalyze } from "./services/pipeline";
-import { annotateScreenshot, type Annotation } from "./services/screenshotAnnotator";
+import { annotateScreenshot, smartAnnotateScreenshot, locateUiElements, type Annotation } from "./services/screenshotAnnotator";
 import { loadAnalysis, listCachedAnalyses } from "./services/cache";
 import {
   summarizeForUserStory,
@@ -330,6 +330,91 @@ The annotated image is saved alongside the original with an _annotated.png suffi
             text: JSON.stringify({ success: false, error: String(err) }),
           },
         ],
+      };
+    }
+  }
+);
+
+// ─── Tool: locate_ui_elements ────────────────────────────────────────────────
+server.tool(
+  "locate_ui_elements",
+  `Use GPT-4o Vision to analyze a screenshot and detect UI elements with their pixel coordinates.
+Returns detected elements with bounding boxes AND a ready-to-use suggestedAnnotations array you can pass directly to annotate_screenshot.
+Optionally provide a focus hint to target specific areas (e.g. "find input fields", "highlight error messages", "show navigation elements").`,
+  {
+    image_path: z.string().describe("Absolute path to the screenshot to analyze"),
+    focus: z
+      .string()
+      .optional()
+      .describe("Optional: natural language description of what to look for, e.g. 'find all form fields' or 'highlight sections that need grouping'"),
+  },
+  async ({ image_path, focus }) => {
+    try {
+      const located = await locateUiElements(image_path, focus);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              imageWidth: located.imageWidth,
+              imageHeight: located.imageHeight,
+              elementCount: located.elements.length,
+              elements: located.elements,
+              suggestedAnnotations: located.suggestedAnnotations,
+              tip: "Pass suggestedAnnotations directly to annotate_screenshot to get a correctly annotated image, or customize them first.",
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify({ error: String(err) }) }],
+      };
+    }
+  }
+);
+
+// ─── Tool: smart_annotate_screenshot ─────────────────────────────────────────
+server.tool(
+  "smart_annotate_screenshot",
+  `Context-aware annotation: automatically analyzes the screenshot with GPT-4o Vision to understand the UI, detects element positions, then applies correctly-placed annotations. No manual coordinates needed.
+Use this instead of annotate_screenshot when you want AI to figure out where things are.
+Provide a focus hint to control what gets highlighted (e.g. "mark all input fields that need grouping", "highlight the problematic section", "annotate the navigation buttons").`,
+  {
+    image_path: z.string().describe("Absolute path to the source screenshot"),
+    focus: z
+      .string()
+      .optional()
+      .describe("What to focus on / what to annotate, e.g. 'group the data connection fields', 'show the bug in the form layout'"),
+    output_path: z
+      .string()
+      .optional()
+      .describe("Where to save the annotated image (defaults to <input>_annotated.png)"),
+  },
+  async ({ image_path, focus, output_path }) => {
+    try {
+      const { result, elements } = await smartAnnotateScreenshot(image_path, focus, output_path);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              outputPath: result.outputPath,
+              annotationCount: result.annotationCount,
+              imageSizePx: { width: result.widthPx, height: result.heightPx },
+              detectedElements: elements.map((e) => ({
+                label: e.label,
+                description: e.description,
+                bounds: { x: e.x, y: e.y, width: e.width, height: e.height },
+              })),
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify({ error: String(err) }) }],
       };
     }
   }

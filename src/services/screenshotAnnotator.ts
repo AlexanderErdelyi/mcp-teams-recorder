@@ -1,6 +1,7 @@
 import sharp from "sharp";
 import * as fs from "fs";
 import * as path from "path";
+import OpenAI from "openai";
 
 // ─── Annotation types ────────────────────────────────────────────────────────
 
@@ -249,4 +250,190 @@ function escapeXml(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+// ─── Vision-based element location ───────────────────────────────────────────
+
+export interface DetectedElement {
+  label: string;
+  description: string;
+  /** Bounding box in pixels */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Suggested annotation type for this element */
+  suggestedAnnotationType: "rect" | "marker" | "text";
+  /** Suggested color based on context (red=problem, green=ok, blue=info, yellow=note) */
+  suggestedColor: string;
+}
+
+export interface LocateElementsResult {
+  elements: DetectedElement[];
+  imageWidth: number;
+  imageHeight: number;
+  /** Ready-to-use annotations array you can pass directly to annotateScreenshot */
+  suggestedAnnotations: Annotation[];
+}
+
+/**
+ * Analyze a screenshot with GPT-4o Vision to detect UI elements and their
+ * pixel coordinates. Optionally focus on specific elements or issues.
+ *
+ * @param imagePath - Path to the screenshot
+ * @param focus - Optional natural-language description of what to look for
+ *                e.g. "find all input fields", "highlight the error messages",
+ *                "mark the buttons that seem misplaced"
+ */
+export async function locateUiElements(
+  imagePath: string,
+  focus?: string
+): Promise<LocateElementsResult> {
+  if (!fs.existsSync(imagePath)) {
+    throw new Error(`Screenshot not found: ${imagePath}`);
+  }
+
+  const meta = await sharp(imagePath).metadata();
+  const W = meta.width ?? 1280;
+  const H = meta.height ?? 720;
+
+  const base64 = fs.readFileSync(imagePath).toString("base64");
+  const ext = path.extname(imagePath).slice(1) || "png";
+  const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : "image/png";
+
+  const { client, visionModel } = await getAnnotatorClient();
+
+  const focusPrompt = focus
+    ? `Focus specifically on: "${focus}".`
+    : "Identify all significant UI elements (sections, form fields, buttons, headers, labels, error indicators, etc.).";
+
+  const systemPrompt = `You are a UI analysis expert. Given a screenshot of a software UI, identify UI elements and return their approximate bounding box coordinates in pixels.
+
+The image dimensions are ${W}×${H} pixels.
+
+Return a JSON object with this exact structure:
+{
+  "elements": [
+    {
+      "label": "short element name",
+      "description": "what this element is and why it's notable",
+      "x": <left edge in pixels>,
+      "y": <top edge in pixels>,
+      "width": <width in pixels>,
+      "height": <height in pixels>,
+      "suggestedAnnotationType": "rect" | "marker" | "text",
+      "suggestedColor": "#ff3b30" for problems/bugs, "#34c759" for correct items, "#007aff" for informational, "#ffcc00" for notes/warnings
+    }
+  ]
+}
+
+Rules:
+- Coordinates must be within 0-${W} (x/width) and 0-${H} (y/height)
+- Be precise: look at visual boundaries of each element
+- suggestedAnnotationType: use "rect" for regions/sections, "marker" for single points/buttons, "text" for notes
+- Return 3-10 elements maximum, prioritize the most relevant
+- Return ONLY valid JSON, no markdown fences`;
+
+  const resp = await client.chat.completions.create({
+    model: visionModel,
+    max_tokens: 1500,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: `${focusPrompt}\n\n${systemPrompt}` },
+          { type: "image_url", image_url: { url: `data:${mime};base64,${base64}`, detail: "high" } },
+        ],
+      },
+    ],
+  });
+
+  const raw = resp.choices[0]?.message?.content ?? "{}";
+  let parsed: { elements: DetectedElement[] };
+  try {
+    // Strip markdown fences if model adds them anyway
+    const clean = raw.replace(/^```[a-z]*\n?/m, "").replace(/```$/m, "").trim();
+    parsed = JSON.parse(clean);
+  } catch {
+    throw new Error(`Vision model returned invalid JSON: ${raw.slice(0, 200)}`);
+  }
+
+  const elements: DetectedElement[] = (parsed.elements ?? []).map((el) => ({
+    ...el,
+    // Clamp coordinates to image bounds
+    x: Math.max(0, Math.min(el.x, W - 1)),
+    y: Math.max(0, Math.min(el.y, H - 1)),
+    width: Math.min(el.width, W - el.x),
+    height: Math.min(el.height, H - el.y),
+  }));
+
+  // Build ready-to-use annotation objects from detected elements
+  const suggestedAnnotations: Annotation[] = elements.map((el, i) => {
+    if (el.suggestedAnnotationType === "marker") {
+      return {
+        type: "marker" as const,
+        x: el.x + Math.round(el.width / 2),
+        y: el.y + Math.round(el.height / 2),
+        number: i + 1,
+        color: el.suggestedColor,
+      };
+    }
+    if (el.suggestedAnnotationType === "text") {
+      return {
+        type: "text" as const,
+        x: el.x,
+        y: el.y + el.height + 20,
+        text: el.label,
+        color: el.suggestedColor,
+        fontSize: 14,
+      };
+    }
+    // default: rect with label
+    return {
+      type: "rect" as const,
+      x: el.x,
+      y: el.y,
+      width: el.width,
+      height: el.height,
+      color: el.suggestedColor,
+      label: el.label,
+      strokeWidth: 3,
+    };
+  });
+
+  return { elements, imageWidth: W, imageHeight: H, suggestedAnnotations };
+}
+
+/**
+ * One-shot: analyze the screenshot, detect elements, apply annotations, save result.
+ * This is the context-aware version — no manual coordinates needed.
+ */
+export async function smartAnnotateScreenshot(
+  imagePath: string,
+  focus?: string,
+  outputPath?: string
+): Promise<{ result: AnnotateResult; elements: DetectedElement[] }> {
+  const located = await locateUiElements(imagePath, focus);
+  const result = await annotateScreenshot({
+    inputPath: imagePath,
+    annotations: located.suggestedAnnotations,
+    outputPath,
+  });
+  return { result, elements: located.elements };
+}
+
+// ─── Auth helper for annotator (mirrors copilotAnalyzer) ─────────────────────
+
+async function getAnnotatorClient(): Promise<{ client: OpenAI; visionModel: string }> {
+  const pat = process.env["GITHUB_TOKEN"];
+  if (!pat) throw new Error("GITHUB_TOKEN env var required");
+  const model = process.env["COPILOT_MODEL"] ?? "gpt-4o";
+  const overrideUrl = process.env["COPILOT_API_URL"];
+  if (overrideUrl) {
+    return { client: new OpenAI({ baseURL: overrideUrl, apiKey: pat }), visionModel: model };
+  }
+  return {
+    client: new OpenAI({ baseURL: "https://models.inference.ai.azure.com", apiKey: pat }),
+    visionModel: model,
+  };
 }
