@@ -176,19 +176,24 @@ export async function analyzeRecording(
     .map((s) => `[${formatTime(s.timestamp)}] ${s.description} (tags: ${s.tags.join(", ")})`)
     .join("\n");
 
-  const prompt = `You are analyzing a Teams meeting recording. 
+  // Use full transcript — no truncation for typical meeting lengths (up to 15000 chars)
+  const transcriptExcerpt = transcriptText.slice(0, 15000);
+  const hasTranscript = transcriptExcerpt.trim().length > 0;
+
+  const prompt = `You are analyzing a Teams meeting recording. The content may be in German, English, or mixed — always respond in the SAME language as the meeting content.
 
 Title: ${title}
 
-Transcript (excerpt — full text provided):
-${transcriptText.slice(0, 6000)}
+${hasTranscript ? `Full Transcript:
+${transcriptExcerpt}` : "No transcript available — analyze from screenshots only."}
 
 Screenshot descriptions:
-${screenshotDescriptions}
+${screenshotDescriptions || "No screenshots available."}
 
-Analyze this recording and respond with ONLY a JSON object in this exact format:
+Analyze this recording and respond with ONLY a valid JSON object in this exact format:
 {
-  "summary": "<2-4 sentence overview of the meeting>",
+  "summary": "<2-4 sentence overview in the meeting's language>",
+  "humanReadableSummary": "<Bullet-point summary in the style of Microsoft Teams auto-summary. Each bullet: '• Topic heading: Description with details. [M:SS]' — include timestamps from the transcript. Write in the same language as the meeting. Aim for 4-8 bullets covering the key discussion points, decisions, and actions.>",
   "keyPoints": ["<point 1>", "<point 2>", ...],
   "issues": [
     {
@@ -216,10 +221,11 @@ Analyze this recording and respond with ONLY a JSON object in this exact format:
   ],
   "actionItems": [
     {
-      "title": "<what needs to be done>",
-      "assignee": "<name if mentioned>",
+      "title": "<what needs to be done — specific and actionable>",
+      "assignee": "<name if mentioned, else null>",
       "priority": "low|medium|high",
-      "context": "<why this is needed>"
+      "context": "<why this is needed and what it involves>",
+      "timestamp": <seconds from start when this was discussed, or 0>
     }
   ],
   "speakers": ["<name1>", "<name2>"],
@@ -263,6 +269,7 @@ Analyze this recording and respond with ONLY a JSON object in this exact format:
 
   return {
     summary: parsed.summary ?? "",
+    humanReadableSummary: parsed.humanReadableSummary ?? parsed.summary ?? "",
     keyPoints: parsed.keyPoints ?? [],
     issues: issuesWithScreenshots,
     features: featuresWithScreenshots,

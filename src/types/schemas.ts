@@ -40,9 +40,10 @@ export const DecisionSchema = z.object({
 
 export const ActionItemSchema = z.object({
   title: z.string(),
-  assignee: z.string().optional(),
+  assignee: z.string().optional().nullable(),
   priority: z.enum(["low", "medium", "high"]),
   context: z.string(),
+  timestamp: z.number().optional().default(0),
 });
 
 export const RecordingAnalysisSchema = z.object({
@@ -56,6 +57,7 @@ export const RecordingAnalysisSchema = z.object({
   screenshots: z.array(ScreenshotSchema),
   analysis: z.object({
     summary: z.string(),
+    humanReadableSummary: z.string().optional().default(""),
     keyPoints: z.array(z.string()),
     issues: z.array(IssueSchema),
     features: z.array(FeatureSchema),

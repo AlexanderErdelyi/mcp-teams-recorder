@@ -41,9 +41,10 @@ export interface Decision {
 
 export interface ActionItem {
   title: string;
-  assignee?: string;
+  assignee?: string | null;
   priority: "low" | "medium" | "high";
   context: string;
+  timestamp?: number;
 }
 
 export interface RecordingAnalysis {
@@ -59,6 +60,7 @@ export interface RecordingAnalysis {
 
   analysis: {
     summary: string;
+    humanReadableSummary: string;  // timestamped bullet points, language-native, like Teams auto-summary
     keyPoints: string[];
     issues: Issue[];
     features: Feature[];

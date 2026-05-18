@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync, spawnSync } from "child_process";
-import type { RecordingAnalysis } from "../types/index";
+import type { RecordingAnalysis, TranscriptSegment } from "../types/index";
 import { parseTranscript, transcriptToPlainText } from "./transcriptParser";
 import { extractScreenshots } from "./screenshotExtractor";
 import { scoreScreenshots } from "./copilotAnalyzer";
@@ -222,6 +222,11 @@ export async function processRecordingUrl(
       const result = downloadViaYtDlp(url, tempDir, token);
       videoPath = result.videoPath;
       transcriptPath = result.transcriptPath;
+
+      // If yt-dlp didn't get the transcript, try to fetch the VTT directly from SharePoint
+      if (!transcriptPath && videoPath) {
+        transcriptPath = await tryDownloadTranscriptDirectly(url, videoPath, tempDir);
+      }
     } catch (ytErr) {
       throw new Error(
         `All download methods failed.\n\n` +
@@ -241,6 +246,152 @@ export async function processRecordingUrl(
   }
 
   return processLocalFiles(videoPath, transcriptPath, url, id, "url");
+}
+
+// Try to download the VTT transcript directly from SharePoint (same folder as the MP4)
+// Teams stores it alongside the recording with the same base name but .vtt extension.
+async function tryDownloadTranscriptDirectly(
+  originalUrl: string,
+  videoPath: string,
+  destDir: string
+): Promise<string | null> {
+  const info = parseRecordingUrl(originalUrl);
+  if (!info.hostname || !info.filePath) return null;
+
+  // Build candidate VTT paths — Teams typically uses same base name as the MP4
+  const baseName = path.basename(info.filePath, path.extname(info.filePath));
+  const folderPath = info.filePath.substring(0, info.filePath.lastIndexOf("/"));
+  const vttCandidates = [
+    `${folderPath}/${baseName}.vtt`,
+    `${folderPath}/${baseName}-Transcript.vtt`,
+    `${folderPath}/${baseName}_transcript.vtt`,
+  ];
+
+  for (const vttServerRelPath of vttCandidates) {
+    const destPath = path.join(destDir, path.basename(vttServerRelPath));
+    try {
+      console.error(`Trying to download transcript: ${vttServerRelPath}`);
+      await downloadWithSharePointToken(info.hostname, vttServerRelPath, destPath);
+      // Verify it looks like a VTT file (not an error HTML page)
+      const content = fs.readFileSync(destPath, "utf-8");
+      if (content.includes("WEBVTT") || content.trim().length > 50) {
+        console.error(`✅ Transcript downloaded: ${path.basename(destPath)}`);
+        return destPath;
+      }
+      fs.unlinkSync(destPath); // delete corrupt file
+    } catch { /* try next */ }
+  }
+
+  console.error("Could not auto-download transcript (SharePoint access restricted). Use inject_transcript to provide it manually.");
+  return null;
+}
+
+// Re-analyze an existing recording with a newly provided transcript text.
+// Useful when auto-download of VTT failed and the user copies the transcript from Teams.
+export async function injectTranscriptAndReanalyze(
+  id: string,
+  transcriptText: string
+): Promise<RecordingAnalysis> {
+  const existing = loadAnalysis(id);
+  if (!existing) throw new Error(`No cached analysis found for ID: ${id}`);
+
+  // Parse the transcript — detect format
+  let segments: TranscriptSegment[];
+
+  if (transcriptText.trimStart().startsWith("WEBVTT")) {
+    // Standard VTT format — write to temp file and parse
+    const tmpVtt = path.join(os.tmpdir(), `mcp-inject-${id}.vtt`);
+    fs.writeFileSync(tmpVtt, transcriptText, "utf-8");
+    try {
+      segments = await parseTranscript(tmpVtt);
+    } finally {
+      try { fs.unlinkSync(tmpVtt); } catch { /* ok */ }
+    }
+  } else {
+    // Plain text or Teams auto-summary format — convert to segments
+    // Try to detect timestamped lines like "Text here 0:16" or "[0:16] Text" or "0:16 Text"
+    segments = parseTimestampedText(transcriptText);
+  }
+
+  console.error(`Re-analyzing with ${segments.length} transcript segments...`);
+
+  // Re-run full AI analysis with the new transcript (keep existing screenshots)
+  const newAnalysis = await analyzeRecording(segments, existing.screenshots, existing.title);
+  const plainText = transcriptToPlainText(segments);
+
+  const updated: RecordingAnalysis = {
+    ...existing,
+    transcript: segments,
+    analysis: newAnalysis,
+    raw: {
+      ...existing.raw,
+      transcriptText: plainText || transcriptText,
+    },
+  };
+
+  if (segments.length > 0) {
+    const last = segments[segments.length - 1];
+    if (last && last.end > 0) {
+      const h = Math.floor(last.end / 3600);
+      const m = Math.floor((last.end % 3600) / 60);
+      const s = Math.floor(last.end % 60);
+      updated.duration = [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
+    }
+  }
+
+  saveAnalysis(updated);
+  console.error(`Re-analysis complete with transcript. Cached as ${id}`);
+  return updated;
+}
+
+// Parse a plain/timestamped text block into TranscriptSegment[]
+// Handles Teams auto-summary format: "Topic: text. 0:16"
+// and simple: "[0:16] Speaker: text" or "0:16 text"
+function parseTimestampedText(text: string): TranscriptSegment[] {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const segments: TranscriptSegment[] = [];
+  let currentTime = 0;
+
+  for (const line of lines) {
+    // Match timestamps: 0:16, 1:06, 10:30 or 1:06:30
+    const tsMatch = line.match(/(\d{1,2}:\d{2}(?::\d{2})?)[\s.]*$/);
+    let timestamp = currentTime;
+    let textContent = line;
+
+    if (tsMatch && tsMatch[1]) {
+      const parts = tsMatch[1].split(":").map(Number);
+      timestamp = parts.length === 3
+        ? (parts[0]! * 3600) + (parts[1]! * 60) + (parts[2]!)
+        : (parts[0]! * 60) + (parts[1]!);
+      textContent = line.slice(0, tsMatch.index).trim();
+    }
+
+    // Match speaker prefix: "Speaker: text" or "[timestamp] Speaker: text"
+    const bracketTs = textContent.match(/^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*/);
+    if (bracketTs) {
+      const parts = bracketTs[1]!.split(":").map(Number);
+      timestamp = parts.length === 3
+        ? (parts[0]! * 3600) + (parts[1]! * 60) + (parts[2]!)
+        : (parts[0]! * 60) + (parts[1]!);
+      textContent = textContent.slice(bracketTs[0].length).trim();
+    }
+
+    const speakerMatch = textContent.match(/^([A-ZÄÖÜa-zäöüß][^:]{1,30}):\s+(.+)/);
+    const speaker = speakerMatch ? speakerMatch[1]!.trim() : "Speaker";
+    const finalText = speakerMatch ? speakerMatch[2]!.trim() : textContent;
+
+    if (finalText.length > 0) {
+      segments.push({
+        start: timestamp,
+        end: timestamp + 30, // estimate 30s per segment
+        speaker,
+        text: finalText,
+      });
+      currentTime = timestamp + 30;
+    }
+  }
+
+  return segments;
 }
 
 // Process a recording from a local folder (Plan B)
@@ -335,7 +486,5 @@ function formatDuration(segments: TranscriptSegment[]): string {
   return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
 }
 
-// Import type for use in formatDuration
-import type { TranscriptSegment } from "../types/index";
 
 

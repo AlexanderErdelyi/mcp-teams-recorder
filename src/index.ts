@@ -2,7 +2,7 @@ import "dotenv/config";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { processRecordingUrl, processRecordingFolder } from "./services/pipeline";
+import { processRecordingUrl, processRecordingFolder, injectTranscriptAndReanalyze } from "./services/pipeline";
 import { loadAnalysis, listCachedAnalyses } from "./services/cache";
 import {
   summarizeForUserStory,
@@ -199,6 +199,83 @@ server.tool(
       return { content: [{ type: "text", text: `No analysis found for ID: ${recording_id}` }], isError: true };
     }
     return { content: [{ type: "text", text: JSON.stringify(summarizeForFeedback(analysis), null, 2) }] };
+  }
+);
+
+// ─── Tool: inject_transcript ─────────────────────────────────────────────────
+server.tool(
+  "inject_transcript",
+  "Provide a transcript for an existing recording and re-run the AI analysis. Use when auto-download of the VTT failed. Accepts: raw VTT content, Teams auto-summary text, or any timestamped text. Returns the updated RecordingAnalysis with full transcript-based insights.",
+  {
+    recording_id: z.string().describe("Recording ID from a previous process_recording_* call"),
+    transcript_text: z.string().describe("Transcript content: VTT format, Teams auto-summary text, or plain timestamped text. Copy from Teams → Open Transcript → Download, or paste the meeting summary."),
+  },
+  async ({ recording_id, transcript_text }) => {
+    try {
+      const analysis = await injectTranscriptAndReanalyze(recording_id, transcript_text);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ...analysis,
+                screenshots: analysis.screenshots.map(({ base64: _b, ...s }) => s),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ─── Tool: get_full_transcript ───────────────────────────────────────────────
+server.tool(
+  "get_full_transcript",
+  "Get the full plain-text transcript and human-readable summary for a recording. Use this to pass the complete transcript to other AI agents (documentation, work item creation, etc.).",
+  {
+    recording_id: z.string().describe("Recording ID from a previous process_recording_* call"),
+  },
+  async ({ recording_id }) => {
+    const analysis = loadAnalysis(recording_id);
+    if (!analysis) {
+      return {
+        content: [{ type: "text", text: `No analysis found for ID: ${recording_id}` }],
+        isError: true,
+      };
+    }
+    const hasTranscript = analysis.transcript.length > 0 || (analysis.raw?.transcriptText?.length ?? 0) > 0;
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              recordingId: analysis.id,
+              title: analysis.title,
+              duration: analysis.duration,
+              hasTranscript,
+              transcriptSegmentCount: analysis.transcript.length,
+              humanReadableSummary: analysis.analysis.humanReadableSummary,
+              fullTranscriptText: analysis.raw?.transcriptText ?? "",
+              actionItems: analysis.analysis.actionItems,
+              speakers: analysis.analysis.speakers,
+              topics: analysis.analysis.topics,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
   }
 );
 
