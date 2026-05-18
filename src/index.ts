@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { processRecordingUrl, processRecordingFolder, injectTranscriptAndReanalyze } from "./services/pipeline";
+import { annotateScreenshot, type Annotation } from "./services/screenshotAnnotator";
 import { loadAnalysis, listCachedAnalyses } from "./services/cache";
 import {
   summarizeForUserStory,
@@ -276,6 +277,61 @@ server.tool(
         },
       ],
     };
+  }
+);
+
+// ─── Tool: annotate_screenshot ───────────────────────────────────────────────
+server.tool(
+  "annotate_screenshot",
+  `Add visual annotations (rectangles, text notes, numbered markers, arrows) to a screenshot and save the result as a new file.
+Annotations array supports four types:
+  - rect:   highlight an area  { type:"rect", x, y, width, height, color?, label?, strokeWidth?, fill? }
+  - text:   add a note         { type:"text", x, y, text, color?, fontSize?, background? }
+  - marker: numbered pin       { type:"marker", x, y, number, color? }
+  - arrow:  draw an arrow      { type:"arrow", fromX, fromY, toX, toY, color?, strokeWidth? }
+Coordinates are in pixels from the top-left corner.
+Colors accept CSS hex values (#ff0000) or rgba strings.
+The annotated image is saved alongside the original with an _annotated.png suffix (or to output_path if provided).`,
+  {
+    input_path: z.string().describe("Absolute path to the source screenshot (PNG or JPEG)"),
+    annotations: z
+      .array(z.record(z.string(), z.unknown()))
+      .describe("Array of annotation objects (rect / text / marker / arrow)"),
+    output_path: z
+      .string()
+      .optional()
+      .describe("Where to save the annotated image (optional; defaults to <input>_annotated.png)"),
+  },
+  async ({ input_path, annotations, output_path }) => {
+    try {
+      const result = await annotateScreenshot({
+        inputPath: input_path,
+        annotations: annotations as unknown as Annotation[],
+        outputPath: output_path,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              outputPath: result.outputPath,
+              annotationCount: result.annotationCount,
+              imageSizePx: { width: result.widthPx, height: result.heightPx },
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: String(err) }),
+          },
+        ],
+      };
+    }
   }
 );
 
