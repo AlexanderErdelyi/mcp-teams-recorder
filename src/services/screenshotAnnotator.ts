@@ -277,13 +277,11 @@ export interface LocateElementsResult {
 }
 
 /**
- * Analyze a screenshot with GPT-4o Vision to detect UI elements and their
- * pixel coordinates. Optionally focus on specific elements or issues.
- *
- * @param imagePath - Path to the screenshot
- * @param focus - Optional natural-language description of what to look for
- *                e.g. "find all input fields", "highlight the error messages",
- *                "mark the buttons that seem misplaced"
+ * Analyze a screenshot with GPT-4o Vision to detect UI elements.
+ * Uses a grid-based localization strategy for accuracy:
+ *   1. Overlay a labeled grid (cols A-H, rows 1-8) on a downscaled copy
+ *   2. Ask the model: "which grid cell(s) contain element X?"
+ *   3. Compute pixel coordinates from grid cell boundaries — no guessing
  */
 export async function locateUiElements(
   imagePath: string,
@@ -297,77 +295,133 @@ export async function locateUiElements(
   const W = meta.width ?? 1280;
   const H = meta.height ?? 720;
 
-  const base64 = fs.readFileSync(imagePath).toString("base64");
-  const ext = path.extname(imagePath).slice(1) || "png";
-  const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : "image/png";
-
   const { client, visionModel } = await getAnnotatorClient();
 
+  // ── Step 1: build a downscaled grid image ───────────────────────────────────
+  const COLS = 8;
+  const ROWS = 12;  // finer vertical resolution for single-row fields
+  const GW = 960;
+  const GH = Math.round(H * (GW / W));
+  const cellW = Math.round(GW / COLS);
+  const cellH = Math.round(GH / ROWS);
+
+  // Build SVG grid overlay: column labels A-H, row labels 1-8
+  const colLetters = ["A", "B", "C", "D", "E", "F", "G", "H"];
+  const gridLines: string[] = [];
+
+  // Vertical lines + column labels
+  for (let c = 0; c <= COLS; c++) {
+    const x = c * cellW;
+    gridLines.push(`<line x1="${x}" y1="0" x2="${x}" y2="${GH}" stroke="rgba(255,0,0,0.4)" stroke-width="1"/>`);
+    if (c < COLS) {
+      gridLines.push(`<text x="${x + cellW / 2}" y="16" text-anchor="middle" font-family="monospace" font-size="13" font-weight="bold" fill="red">${colLetters[c]}</text>`);
+    }
+  }
+  // Horizontal lines + row labels
+  for (let r = 0; r <= ROWS; r++) {
+    const y = r * cellH;
+    gridLines.push(`<line x1="0" y1="${y}" x2="${GW}" y2="${y}" stroke="rgba(255,0,0,0.4)" stroke-width="1"/>`);
+    if (r < ROWS) {
+      gridLines.push(`<text x="8" y="${y + cellH / 2 + 5}" font-family="monospace" font-size="13" font-weight="bold" fill="red">${r + 1}</text>`);
+    }
+  }
+
+  const gridSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${GW}" height="${GH}">${gridLines.join("")}</svg>`;
+
+  const gridImgBuf = await sharp(imagePath)
+    .resize(GW, GH)
+    .composite([{ input: Buffer.from(gridSvg), top: 0, left: 0 }])
+    .png()
+    .toBuffer();
+  const gridB64 = gridImgBuf.toString("base64");
+
+  // ── Step 2: ask model to identify grid cells ────────────────────────────────
   const focusPrompt = focus
-    ? `Focus specifically on: "${focus}".`
-    : "Identify all significant UI elements (sections, form fields, buttons, headers, labels, error indicators, etc.).";
+    ? `Task: "${focus}".`
+    : "Identify the most significant UI elements on this page.";
 
-  const systemPrompt = `You are a UI analysis expert. Given a screenshot of a software UI, identify UI elements and return their approximate bounding box coordinates in pixels.
+  const gridPrompt = `${focusPrompt}
 
-The image dimensions are ${W}×${H} pixels.
+The image has a red grid overlay with columns A-H (left to right) and rows 1-8 (top to bottom).
+Each cell is labeled — e.g. "A1" is top-left, "H8" is bottom-right.
 
-Return a JSON object with this exact structure:
+For each element requested, identify which grid cells it occupies and return:
+- fromCol/fromRow: top-left cell of the element  
+- toCol/toRow: bottom-right cell of the element (can be same as from for single-cell elements)
+- For GROUPING: return ONE entry covering all items that should be grouped together
+
+Return ONLY valid JSON, no markdown:
 {
   "elements": [
     {
-      "label": "short element name",
-      "description": "what this element is and why it's notable",
-      "x": <left edge in pixels>,
-      "y": <top edge in pixels>,
-      "width": <width in pixels>,
-      "height": <height in pixels>,
-      "suggestedAnnotationType": "rect" | "marker" | "text",
-      "suggestedColor": "#ff3b30" for problems/bugs, "#34c759" for correct items, "#007aff" for informational, "#ffcc00" for notes/warnings
+      "label": "short name",
+      "description": "what it is",
+      "fromCol": "B", "fromRow": 3,
+      "toCol": "D", "toRow": 3,
+      "suggestedAnnotationType": "rect",
+      "suggestedColor": "#ff3b30"
     }
   ]
 }
 
-Rules:
-- Coordinates must be within 0-${W} (x/width) and 0-${H} (y/height)
-- Be precise: look at visual boundaries of each element
-- suggestedAnnotationType: use "rect" for regions/sections, "marker" for single points/buttons, "text" for notes
-- Return 3-10 elements maximum, prioritize the most relevant
-- Return ONLY valid JSON, no markdown fences`;
+Color guide: "#ff3b30"=red/problem, "#34c759"=green/good, "#007aff"=blue/info, "#ffcc00"=yellow/warning, "#af52de"=purple/grouping`;
 
   const resp = await client.chat.completions.create({
     model: visionModel,
-    max_tokens: 1500,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: `${focusPrompt}\n\n${systemPrompt}` },
-          { type: "image_url", image_url: { url: `data:${mime};base64,${base64}`, detail: "high" } },
-        ],
-      },
-    ],
+    max_tokens: 1200,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: gridPrompt },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${gridB64}`, detail: "high" } },
+      ],
+    }],
   });
 
   const raw = resp.choices[0]?.message?.content ?? "{}";
-  let parsed: { elements: DetectedElement[] };
+  let parsed: { elements: Array<Record<string, unknown>> };
   try {
-    // Strip markdown fences if model adds them anyway
-    const clean = raw.replace(/^```[a-z]*\n?/m, "").replace(/```$/m, "").trim();
+    const clean = raw.replace(/^```[a-z]*\n?/gm, "").replace(/```/g, "").trim();
     parsed = JSON.parse(clean);
   } catch {
-    throw new Error(`Vision model returned invalid JSON: ${raw.slice(0, 200)}`);
+    throw new Error(`Vision model returned invalid JSON: ${raw.slice(0, 300)}`);
   }
 
-  const elements: DetectedElement[] = (parsed.elements ?? []).map((el) => ({
-    ...el,
-    // Clamp coordinates to image bounds
-    x: Math.max(0, Math.min(el.x, W - 1)),
-    y: Math.max(0, Math.min(el.y, H - 1)),
-    width: Math.min(el.width, W - el.x),
-    height: Math.min(el.height, H - el.y),
-  }));
+  // ── Step 3: convert grid cells → pixel coordinates ─────────────────────────
+  const fullCellW = W / COLS;
+  const fullCellH = H / ROWS;
 
-  // Build ready-to-use annotation objects from detected elements
+  const elements: DetectedElement[] = (parsed.elements ?? []).map((el) => {
+    const fc = colLetters.indexOf(String(el["fromCol"] ?? "A").toUpperCase());
+    const tc = colLetters.indexOf(String(el["toCol"] ?? el["fromCol"] ?? "A").toUpperCase());
+    const fr = Math.max(0, Number(el["fromRow"] ?? 1) - 1); // 1-indexed → 0-indexed
+    const tr = Math.max(0, Number(el["toRow"] ?? el["fromRow"] ?? 1) - 1);
+
+    const fromColIdx = Math.max(0, fc < 0 ? 0 : fc);
+    const toColIdx   = Math.min(COLS - 1, tc < 0 ? fromColIdx : tc);
+    const fromRowIdx = Math.min(ROWS - 1, fr);
+    const toRowIdx   = Math.min(ROWS - 1, tr);
+
+    const px = Math.round(fromColIdx * fullCellW);
+    const py = Math.round(fromRowIdx * fullCellH);
+    const pw = Math.round((toColIdx - fromColIdx + 1) * fullCellW);
+    const ph = Math.round((toRowIdx - fromRowIdx + 1) * fullCellH);
+
+    return {
+      label: String(el["label"] ?? ""),
+      description: String(el["description"] ?? ""),
+      x: px,
+      y: py,
+      width: Math.min(pw, W - px),
+      height: Math.min(ph, H - py),
+      suggestedAnnotationType: (el["suggestedAnnotationType"] as DetectedElement["suggestedAnnotationType"]) ?? "rect",
+      suggestedColor: String(el["suggestedColor"] ?? "#007aff"),
+    };
+  });
+
+  const fontSize   = Math.max(16, Math.round(H / 45));
+  const strokeWidth = Math.max(4, Math.round(H / 200));
+
   const suggestedAnnotations: Annotation[] = elements.map((el, i) => {
     if (el.suggestedAnnotationType === "marker") {
       return {
@@ -382,13 +436,12 @@ Rules:
       return {
         type: "text" as const,
         x: el.x,
-        y: el.y + el.height + 20,
+        y: el.y + el.height + fontSize + 4,
         text: el.label,
         color: el.suggestedColor,
-        fontSize: 14,
+        fontSize,
       };
     }
-    // default: rect with label
     return {
       type: "rect" as const,
       x: el.x,
@@ -397,7 +450,7 @@ Rules:
       height: el.height,
       color: el.suggestedColor,
       label: el.label,
-      strokeWidth: 3,
+      strokeWidth,
     };
   });
 
