@@ -143,11 +143,64 @@ Be strict: blank screens, loading spinners, or static desktop should score below
     }
   }
 
-  // Return only screenshots with relevance >= 0.3, capped at 20
-  return scored
-    .filter((s) => s.relevanceScore >= 0.3)
-    .sort((a, b) => b.relevanceScore - a.relevanceScore)
-    .slice(0, 20);
+  // Filter low-relevance, deduplicate visually similar screens, cap at 20
+  const filtered = scored.filter((s) => s.relevanceScore >= 0.3);
+  return deduplicateScreenshots(filtered).slice(0, 20);
+}
+
+// Remove screenshots that show the same UI state.
+// Uses Jaccard similarity on description words + tag overlap + time proximity.
+// Keeps the highest-scored representative per unique screen.
+function deduplicateScreenshots(screenshots: Screenshot[]): Screenshot[] {
+  // Sort best-first so we keep the highest-scored version of each unique screen
+  const sorted = [...screenshots].sort((a, b) => b.relevanceScore - a.relevanceScore);
+  const kept: Screenshot[] = [];
+
+  for (const candidate of sorted) {
+    const isDuplicate = kept.some((existing) => isSameScreen(existing, candidate));
+    if (!isDuplicate) kept.push(candidate);
+  }
+
+  // Restore chronological order for downstream consumers
+  return kept.sort((a, b) => a.timestamp - b.timestamp);
+}
+
+// Two screenshots are "the same screen" if they are visually/semantically similar
+// AND close in time (within 120s) OR strongly similar regardless of time.
+function isSameScreen(a: Screenshot, b: Screenshot): boolean {
+  const descSimilarity = jaccardWords(a.description, b.description);
+  const tagSimilarity = jaccardSet(a.tags, b.tags);
+  const timeDiff = Math.abs(a.timestamp - b.timestamp);
+
+  // Very strong description overlap → same screen regardless of time
+  if (descSimilarity > 0.65) return true;
+
+  // Moderate description overlap + close in time
+  if (descSimilarity > 0.35 && timeDiff < 120) return true;
+
+  // Same tag signature (same type of UI) + close in time → same screen
+  // e.g. both tagged ["ui", "form", "configuration"] appearing within 2 minutes
+  if (tagSimilarity > 0.6 && timeDiff < 120) return true;
+
+  return false;
+}
+
+function jaccardWords(a: string, b: string): number {
+  const wordsOf = (s: string) =>
+    new Set(s.toLowerCase().split(/\W+/).filter((w) => w.length > 3));
+  const wa = wordsOf(a);
+  const wb = wordsOf(b);
+  const intersection = [...wa].filter((w) => wb.has(w)).length;
+  const union = new Set([...wa, ...wb]).size;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function jaccardSet(a: string[], b: string[]): number {
+  const sa = new Set(a.map((s) => s.toLowerCase()));
+  const sb = new Set(b.map((s) => s.toLowerCase()));
+  const intersection = [...sa].filter((w) => sb.has(w)).length;
+  const union = new Set([...sa, ...sb]).size;
+  return union === 0 ? 0 : intersection / union;
 }
 
 // Step 2: Full recording analysis from transcript + filtered screenshots
