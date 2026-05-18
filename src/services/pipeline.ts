@@ -28,7 +28,24 @@ export async function processRecordingUrl(
   const clientId = process.env["AZURE_CLIENT_ID"]; // optional
 
   console.error("Authenticating with Microsoft Graph...");
-  const token = await getGraphToken(tenantId, clientId ?? undefined);
+  let token: string;
+  try {
+    token = await getGraphToken(tenantId, clientId ?? undefined);
+  } catch (authErr) {
+    throw new Error(
+      `Cannot access SharePoint — authentication failed.\n\n` +
+      `Tried:\n` +
+      `  1. Azure CLI (az login) — not logged in or az not installed\n` +
+      `  2. Device code sign-in — ${tenantId ? "failed" : "AZURE_TENANT_ID not set"}\n` +
+      `  3. App registration — ${clientId ? "failed" : "AZURE_CLIENT_ID not set"}\n\n` +
+      `➡  Plan B (no auth needed):\n` +
+      `   1. Download the recording from Teams manually (.mp4)\n` +
+      `   2. Download the transcript: in Teams → ... → Open transcript → Download (.vtt)\n` +
+      `   3. Put both files in a folder, e.g. C:\\recordings\\my-meeting\\\n` +
+      `   4. Call: process_recording_folder({ folder_path: "C:\\\\recordings\\\\my-meeting" })\n\n` +
+      `Original error: ${(authErr as Error).message}`
+    );
+  }
 
   // Download to temp dir
   const tempDir = path.join(os.tmpdir(), `mcp-rec-${id}`);
