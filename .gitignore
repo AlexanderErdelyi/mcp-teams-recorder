@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.recordings-cache/
+*.env
+.env.local
+~/.mcp-teams-recorder-token.json
+*.js.map
