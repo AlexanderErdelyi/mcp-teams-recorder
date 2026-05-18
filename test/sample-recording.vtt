@@ -1,0 +1,41 @@
+WEBVTT
+
+1
+00:00:00.000 --> 00:00:04.500
+<v Sarah (Product Manager)>Good morning everyone, let's get started with the sprint demo.</v>
+
+2
+00:00:04.500 --> 00:00:12.000
+<v Sarah (Product Manager)>Today we're showing the new dashboard feature and I also want to flag a few issues I noticed during testing.</v>
+
+3
+00:00:12.000 --> 00:00:22.000
+<v Tom (Developer)>Sure. So the dashboard now loads in under 2 seconds, we also added the export to Excel functionality that was requested.</v>
+
+4
+00:00:22.000 --> 00:00:35.000
+<v Sarah (Product Manager)>Great. But I noticed when I click the filter button on the reports page, it throws an error. It says "Cannot read property of undefined". That's a critical issue.</v>
+
+5
+00:00:35.000 --> 00:00:48.000
+<v Tom (Developer)>Yes, I know about that one. It happens when there's no data for the selected date range. We need to add a null check there. I'll fix that in the next sprint.</v>
+
+6
+00:00:48.000 --> 00:01:02.000
+<v Sarah (Product Manager)>Also the mobile layout is broken on iPhone — the navigation menu overlaps the content. Users are complaining.</v>
+
+7
+00:01:02.000 --> 00:01:15.000
+<v Tom (Developer)>That's a CSS issue with the z-index. I can fix that today. We also decided to move the user settings page to the sidebar instead of the top nav — everyone agreed on that last week.</v>
+
+8
+00:01:15.000 --> 00:01:28.000
+<v Sarah (Product Manager)>Right. Action items: Tom fixes the filter null check and the mobile layout bug. We also need to write documentation for the new dashboard export feature.</v>
+
+9
+00:01:28.000 --> 00:01:40.000
+<v Tom (Developer)>Agreed. I'll also need to update the API docs since the export endpoint changed signature. Should be done by end of week.</v>
+
+10
+00:01:40.000 --> 00:01:50.000
+<v Sarah (Product Manager)>Perfect. Overall the sprint went well, good progress on the dashboard. Let's wrap up here.</v>

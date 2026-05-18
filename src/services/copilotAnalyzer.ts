@@ -2,8 +2,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import OpenAI from "openai";
-import type { Screenshot, TranscriptSegment, RecordingAnalysis } from "../types/index.js";
-import type { ExtractedFrame } from "./screenshotExtractor.js";
+import type { Screenshot, TranscriptSegment, RecordingAnalysis } from "../types/index";
+import type { ExtractedFrame } from "./screenshotExtractor";
 
 function getCopilotClient(): OpenAI {
   const token = process.env["GITHUB_TOKEN"];
@@ -220,3 +220,5 @@ function formatTime(seconds: number): string {
   const s = Math.floor(seconds % 60);
   return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
 }
+
+

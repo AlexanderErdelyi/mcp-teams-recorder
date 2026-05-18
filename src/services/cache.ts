@@ -1,8 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import type { RecordingAnalysis } from "../types/index.js";
-import { RecordingAnalysisSchema } from "../types/schemas.js";
+import type { RecordingAnalysis } from "../types/index";
+import { RecordingAnalysisSchema } from "../types/schemas";
 
 const CACHE_DIR = path.resolve(process.cwd(), ".recordings-cache");
 
@@ -64,3 +64,5 @@ export function deleteAnalysis(id: string): boolean {
   }
   return false;
 }
+
+

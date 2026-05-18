@@ -4,7 +4,7 @@ import type {
   BugReportSummary,
   DocumentationSummary,
   FeedbackSummary,
-} from "../types/index.js";
+} from "../types/index";
 
 // Reshape RecordingAnalysis into a user story draft.
 // Returns structured data — caller uses Azure MCP / ADO skill to create the actual work item.
@@ -175,3 +175,5 @@ function formatTime(seconds: number): string {
 function severityRank(s: string): number {
   return { critical: 4, high: 3, medium: 2, low: 1 }[s] ?? 0;
 }
+
+

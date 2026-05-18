@@ -3,7 +3,7 @@ import * as path from "path";
 import * as os from "os";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
-import type { TranscriptSegment } from "../types/index.js";
+import type { TranscriptSegment } from "../types/index";
 
 // Point fluent-ffmpeg at the static binary
 if (ffmpegStatic) {
@@ -149,3 +149,5 @@ function getUniqueTimestamps(segments: TranscriptSegment[]): number[] {
   }
   return result;
 }
+
+

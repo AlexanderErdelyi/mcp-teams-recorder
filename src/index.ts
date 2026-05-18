@@ -2,14 +2,14 @@ import "dotenv/config";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { processRecordingUrl, processRecordingFolder } from "./services/pipeline.js";
-import { loadAnalysis, listCachedAnalyses } from "./services/cache.js";
+import { processRecordingUrl, processRecordingFolder } from "./services/pipeline";
+import { loadAnalysis, listCachedAnalyses } from "./services/cache";
 import {
   summarizeForUserStory,
   summarizeForBugReport,
   summarizeForDocumentation,
   summarizeForFeedback,
-} from "./services/summarizers.js";
+} from "./services/summarizers";
 
 const server = new McpServer({
   name: "mcp-teams-recorder",
@@ -213,3 +213,5 @@ main().catch((err) => {
   console.error("Fatal:", err);
   process.exit(1);
 });
+
+

@@ -1,13 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import type { RecordingAnalysis } from "../types/index.js";
-import { parseTranscript, transcriptToPlainText } from "./transcriptParser.js";
-import { extractScreenshots } from "./screenshotExtractor.js";
-import { scoreScreenshots } from "./copilotAnalyzer.js";
-import { analyzeRecording } from "./copilotAnalyzer.js";
-import { saveAnalysis, loadAnalysis, generateRecordingId } from "./cache.js";
-import { getGraphToken, downloadSharePointFile, listSharePointFolder } from "./graphAuth.js";
+import type { RecordingAnalysis } from "../types/index";
+import { parseTranscript, transcriptToPlainText } from "./transcriptParser";
+import { extractScreenshots } from "./screenshotExtractor";
+import { scoreScreenshots } from "./copilotAnalyzer";
+import { analyzeRecording } from "./copilotAnalyzer";
+import { saveAnalysis, loadAnalysis, generateRecordingId } from "./cache";
+import { getGraphToken, downloadSharePointFile, listSharePointFolder } from "./graphAuth";
 
 const VIDEO_EXTENSIONS = [".mp4", ".mkv", ".webm", ".mov", ".avi"];
 const TRANSCRIPT_EXTENSIONS = [".vtt", ".docx"];
@@ -156,4 +156,6 @@ function formatDuration(segments: TranscriptSegment[]): string {
 }
 
 // Import type for use in formatDuration
-import type { TranscriptSegment } from "../types/index.js";
+import type { TranscriptSegment } from "../types/index";
+
+

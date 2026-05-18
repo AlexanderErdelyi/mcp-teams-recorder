@@ -117,3 +117,5 @@ export interface FeedbackSummary {
   issues: BugReportSummary[];
   relatedScreenshots: string[];
 }
+
+

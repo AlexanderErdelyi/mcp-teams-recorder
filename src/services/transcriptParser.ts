@@ -1,12 +1,14 @@
 import * as fs from "fs";
 import * as path from "path";
 import mammoth from "mammoth";
-import type { TranscriptSegment } from "../types/index.js";
+import type { TranscriptSegment } from "../types/index";
 
 // Parse WebVTT (.vtt) transcript into segments
 export function parseVtt(content: string): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
-  const blocks = content.split(/\n\n+/).filter((b) => b.trim());
+  // Normalize line endings before splitting
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const blocks = normalized.split(/\n\n+/).filter((b) => b.trim());
 
   for (const block of blocks) {
     const lines = block.trim().split("\n");
@@ -104,3 +106,5 @@ function formatTime(seconds: number): string {
   const s = Math.floor(seconds % 60);
   return [h, m, s].map((v) => String(v).padStart(2, "0")).join(":");
 }
+
+
