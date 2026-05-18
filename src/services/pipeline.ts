@@ -33,17 +33,27 @@ async function downloadResolvedFile(
 }
 
 // ── yt-dlp fallback (uses browser cookies — works if user can view in browser) ─
-function ytDlpAvailable(): boolean {
+// Common install locations for yt-dlp (WinGet installs here but may not be on PATH yet)
+const YT_DLP_FALLBACK_PATHS = [
+  path.join(os.homedir(), "AppData", "Local", "Microsoft", "WinGet", "Packages",
+    "yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe", "yt-dlp.exe"),
+  "C:\\ProgramData\\chocolatey\\bin\\yt-dlp.exe",
+];
+
+function resolveYtDlp(): string | null {
   try {
     execSync("yt-dlp --version", { stdio: "pipe" });
-    return true;
-  } catch {
-    return false;
+    return "yt-dlp"; // found on PATH
+  } catch { /* not on PATH */ }
+  for (const p of YT_DLP_FALLBACK_PATHS) {
+    if (fs.existsSync(p)) return p;
   }
+  return null;
 }
 
 function downloadViaYtDlp(url: string, destDir: string, graphToken?: string): { videoPath: string | null; transcriptPath: string | null } {
-  if (!ytDlpAvailable()) {
+  const ytDlpCmd = resolveYtDlp();
+  if (!ytDlpCmd) {
     throw new Error(
       "yt-dlp is not installed.\n" +
       "Install with:  winget install yt-dlp.yt-dlp\n" +
@@ -99,7 +109,7 @@ function downloadViaYtDlp(url: string, destDir: string, graphToken?: string): { 
   for (const { label, args } of strategies) {
     console.error(`Trying yt-dlp with ${label}...`);
     const result = spawnSync(
-      "yt-dlp",
+      ytDlpCmd,
       [...args, ...commonArgs, url],
       { stdio: ["pipe", "pipe", "pipe"], timeout: 600_000 }
     );
