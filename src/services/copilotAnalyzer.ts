@@ -5,22 +5,82 @@ import OpenAI from "openai";
 import type { Screenshot, TranscriptSegment, RecordingAnalysis } from "../types/index";
 import type { ExtractedFrame } from "./screenshotExtractor";
 
-function getCopilotClient(): OpenAI {
-  const token = process.env["GITHUB_TOKEN"];
-  if (!token) throw new Error("GITHUB_TOKEN env var required for GitHub Copilot API");
-
-  return new OpenAI({
-    baseURL: "https://api.githubcopilot.com",
-    apiKey: token,
-  });
+async function getCopilotToken(githubToken: string): Promise<string | null> {
+  // Try current endpoints for Copilot token exchange
+  const endpoints = [
+    "https://api.github.com/copilot_internal/v2/token",
+    "https://api.github.com/copilot_internal/token",
+  ];
+  for (const url of endpoints) {
+    try {
+      const resp = await fetch(url, {
+        headers: { Authorization: `token ${githubToken}`, Accept: "application/json" },
+      });
+      if (resp.ok) {
+        const data = await resp.json() as { token: string };
+        if (data.token) return data.token;
+      }
+    } catch { /* try next */ }
+  }
+  return null;
 }
 
-const MODEL_VISION = "gpt-4o";
-const MODEL_TEXT = "gpt-4o";
+function getGhAuthToken(): string | null {
+  // Use the gh CLI OAuth token — works if `gh auth login` has been run
+  try {
+    const { execSync } = require("child_process") as typeof import("child_process");
+    const token = execSync("gh auth token", { stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
+    if (token && token.length > 10) return token;
+  } catch { /* gh not available or not logged in */ }
+  return null;
+}
+
+async function getCopilotClient(): Promise<{ client: OpenAI; visionModel: string; textModel: string }> {
+  const pat = process.env["GITHUB_TOKEN"];
+  if (!pat) throw new Error("GITHUB_TOKEN env var required");
+
+  const customModel = process.env["COPILOT_MODEL"];
+
+  // Strategy 1: use COPILOT_API_URL override if set
+  const overrideUrl = process.env["COPILOT_API_URL"];
+  if (overrideUrl) {
+    const model = customModel ?? "gpt-4o";
+    return { client: new OpenAI({ baseURL: overrideUrl, apiKey: pat }), visionModel: model, textModel: model };
+  }
+
+  // Strategy 2: exchange PAT for Copilot token → use api.githubcopilot.com
+  const copilotToken = await getCopilotToken(pat);
+  if (copilotToken) {
+    const model = customModel ?? "gpt-4o";
+    console.error(`Using api.githubcopilot.com (Copilot token exchange), model: ${model}`);
+    return { client: new OpenAI({ baseURL: "https://api.githubcopilot.com", apiKey: copilotToken }), visionModel: model, textModel: model };
+  }
+  console.error("Copilot token exchange failed — trying gh auth token...");
+
+  // Strategy 3: gh auth token → exchange for Copilot token
+  const ghToken = getGhAuthToken();
+  if (ghToken && ghToken !== pat) {
+    const copilotToken2 = await getCopilotToken(ghToken);
+    if (copilotToken2) {
+      const model = customModel ?? "gpt-4o";
+      console.error(`Using api.githubcopilot.com (gh auth token exchange), model: ${model}`);
+      return { client: new OpenAI({ baseURL: "https://api.githubcopilot.com", apiKey: copilotToken2 }), visionModel: model, textModel: model };
+    }
+    const model = customModel ?? "gpt-4o";
+    console.error(`Using api.githubcopilot.com (gh auth token direct), model: ${model}`);
+    return { client: new OpenAI({ baseURL: "https://api.githubcopilot.com", apiKey: ghToken }), visionModel: model, textModel: model };
+  }
+
+  // Strategy 4: GitHub Models (needs 'models' PAT permission or classic PAT)
+  // OpenAI-compat SDK uses plain model names (no openai/ prefix)
+  const model = customModel ?? "gpt-4o";
+  console.error(`Using models.inference.ai.azure.com (fallback), model: ${model}`);
+  return { client: new OpenAI({ baseURL: "https://models.inference.ai.azure.com", apiKey: pat }), visionModel: model, textModel: model };
+}
 
 // Step 1: Score each screenshot for relevance using Copilot Vision
 export async function scoreScreenshots(frames: ExtractedFrame[]): Promise<Screenshot[]> {
-  const client = getCopilotClient();
+  const { client, visionModel } = await getCopilotClient();
   const scored: Screenshot[] = [];
 
   for (const frame of frames) {
@@ -31,7 +91,7 @@ export async function scoreScreenshots(frames: ExtractedFrame[]): Promise<Screen
 
     try {
       const response = await client.chat.completions.create({
-        model: MODEL_VISION,
+        model: visionModel,
         messages: [
           {
             role: "user",
@@ -96,7 +156,7 @@ export async function analyzeRecording(
   screenshots: Screenshot[],
   title: string
 ): Promise<RecordingAnalysis["analysis"]> {
-  const client = getCopilotClient();
+  const { client, textModel } = await getCopilotClient();
 
   const transcriptText = transcript
     .map((s) => `[${formatTime(s.start)}] ${s.speaker}: ${s.text}`)
@@ -177,7 +237,7 @@ Analyze this recording and respond with ONLY a JSON object in this exact format:
   ];
 
   const response = await client.chat.completions.create({
-    model: MODEL_TEXT,
+    model: textModel,
     messages,
     max_tokens: 2000,
   });

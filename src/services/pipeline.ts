@@ -1,16 +1,147 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { execSync, spawnSync } from "child_process";
 import type { RecordingAnalysis } from "../types/index";
 import { parseTranscript, transcriptToPlainText } from "./transcriptParser";
 import { extractScreenshots } from "./screenshotExtractor";
 import { scoreScreenshots } from "./copilotAnalyzer";
 import { analyzeRecording } from "./copilotAnalyzer";
 import { saveAnalysis, loadAnalysis, generateRecordingId } from "./cache";
-import { getGraphToken, downloadSharePointFile, listSharePointFolder } from "./graphAuth";
+import { getGraphToken, resolveRecordingFiles, downloadFromUrl, downloadWithSharePointToken, parseRecordingUrl } from "./graphAuth";
 
 const VIDEO_EXTENSIONS = [".mp4", ".mkv", ".webm", ".mov", ".avi"];
 const TRANSCRIPT_EXTENSIONS = [".vtt", ".docx"];
+
+// Download a resolved file — handles both anonymous download URLs and SP-REST URLs
+async function downloadResolvedFile(
+  file: { name: string; downloadUrl: string; mimeType: string },
+  destPath: string,
+  sourceUrl: string
+): Promise<void> {
+  const parsedDl = new URL(file.downloadUrl);
+  if (!parsedDl.searchParams.has("tempauth") && !parsedDl.searchParams.has("access_token")) {
+    const info = parseRecordingUrl(sourceUrl);
+    if (info.hostname) {
+      try {
+        const serverRelativeUrl = parsedDl.pathname;
+        return await downloadWithSharePointToken(info.hostname, serverRelativeUrl, destPath);
+      } catch { /* fall through */ }
+    }
+  }
+  return downloadFromUrl(file.downloadUrl, destPath);
+}
+
+// ── yt-dlp fallback (uses browser cookies — works if user can view in browser) ─
+function ytDlpAvailable(): boolean {
+  try {
+    execSync("yt-dlp --version", { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function downloadViaYtDlp(url: string, destDir: string, graphToken?: string): { videoPath: string | null; transcriptPath: string | null } {
+  if (!ytDlpAvailable()) {
+    throw new Error(
+      "yt-dlp is not installed.\n" +
+      "Install with:  winget install yt-dlp.yt-dlp\n" +
+      "Or:            pip install yt-dlp"
+    );
+  }
+
+  const outputTemplate = path.join(destDir, "%(title)s.%(ext)s");
+
+  // Build a list of strategies to try in order
+  const strategies: { label: string; args: string[] }[] = [];
+
+  // 1. Cookies file from env var (most reliable — doesn't require browser to be closed)
+  const cookiesFile = process.env["COOKIES_FILE"];
+  if (cookiesFile && fs.existsSync(cookiesFile)) {
+    strategies.push({
+      label: `cookies file (${path.basename(cookiesFile)})`,
+      args: ["--cookies", cookiesFile],
+    });
+  }
+
+  // 2. Bearer token via --add-headers (works for some SharePoint setups)
+  if (graphToken) {
+    strategies.push({
+      label: "Bearer token (az login)",
+      args: ["--add-headers", `Authorization:Bearer ${graphToken}`],
+    });
+    // Also try with a SharePoint-scoped token
+    strategies.push({
+      label: "Bearer token (SharePoint-scoped)",
+      args: ["--add-headers", `Authorization:Bearer ${graphToken}`, "--add-headers", "Accept:application/json"],
+    });
+  }
+
+  // 3. Browser cookies (requires browser to be closed)
+  for (const browser of ["edge", "chrome", "firefox", "chromium"]) {
+    strategies.push({
+      label: `${browser} browser cookies`,
+      args: ["--cookies-from-browser", browser],
+    });
+  }
+
+  const commonArgs = [
+    "--write-subs",
+    "--write-auto-subs",
+    "--sub-langs", "en.*,de.*",
+    "--sub-format", "vtt",
+    "--convert-subs", "vtt",
+    "-o", outputTemplate,
+  ];
+
+  let lastError = "";
+  for (const { label, args } of strategies) {
+    console.error(`Trying yt-dlp with ${label}...`);
+    const result = spawnSync(
+      "yt-dlp",
+      [...args, ...commonArgs, url],
+      { stdio: ["pipe", "pipe", "pipe"], timeout: 600_000 }
+    );
+
+    if (result.status === 0) {
+      const files = fs.readdirSync(destDir);
+      const videoFile = files.find((f) => VIDEO_EXTENSIONS.includes(path.extname(f).toLowerCase()));
+      const transcriptFile = files.find((f) => f.endsWith(".vtt") || f.endsWith(".srt"));
+      console.error(`✅ yt-dlp download complete via ${label}. Files: ${files.join(", ")}`);
+      return {
+        videoPath: videoFile ? path.join(destDir, videoFile) : null,
+        transcriptPath: transcriptFile ? path.join(destDir, transcriptFile) : null,
+      };
+    }
+
+    const stderr = (result.stderr?.toString() ?? "").trim();
+    const isAuthError = stderr.includes("cookie") || stderr.includes("Could not find") ||
+      stderr.includes("browser") || stderr.includes("login") || stderr.includes("401") ||
+      stderr.includes("403") || stderr.includes("Unsupported URL");
+    lastError = stderr.substring(0, 300);
+
+    if (isAuthError) {
+      console.error(`  ↳ auth/cookie issue, trying next strategy...`);
+      continue;
+    }
+    // Non-auth error — stop trying
+    console.error(`  ↳ yt-dlp error: ${lastError}`);
+    break;
+  }
+
+  throw new Error(
+    "yt-dlp: all download strategies failed.\n\n" +
+    "Best fix — export cookies from your browser:\n" +
+    "  1. Install the 'Get cookies.txt LOCALLY' extension in Edge/Chrome\n" +
+    "  2. Navigate to your SharePoint site and log in\n" +
+    "  3. Click the extension → Export cookies.txt\n" +
+    "  4. Set COOKIES_FILE=C:\\path\\to\\cookies.txt in your .env file\n\n" +
+    "Alternatively, close Edge/Chrome completely and retry (browser was likely open\n" +
+    "and locking its cookie database).\n\n" +
+    `Last error: ${lastError}`
+  );
+}
 
 // Process a recording from a SharePoint/Stream URL
 export async function processRecordingUrl(
@@ -51,27 +182,62 @@ export async function processRecordingUrl(
   const tempDir = path.join(os.tmpdir(), `mcp-rec-${id}`);
   fs.mkdirSync(tempDir, { recursive: true });
 
-  // If URL points to a folder, list and find video + transcript
-  // If URL points directly to a file, download it
-  console.error("Listing SharePoint folder...");
-  const files = await listSharePointFolder(token, url);
+  // Try Graph/SharePoint REST API first
+  let videoPath: string | null = null;
+  let transcriptPath: string | null = null;
 
-  const videoFile = files.find((f) => VIDEO_EXTENSIONS.includes(path.extname(f.name).toLowerCase()));
-  const transcriptFile = files.find((f) => TRANSCRIPT_EXTENSIONS.includes(path.extname(f.name).toLowerCase()));
+  let graphFailed = false;
+  try {
+    console.error("Resolving recording files from URL...");
+    const files = await resolveRecordingFiles(token, url);
 
-  if (!videoFile) {
-    throw new Error("No video file found at the provided URL. Supported: " + VIDEO_EXTENSIONS.join(", "));
+    const videoFile = files.find((f) => VIDEO_EXTENSIONS.includes(path.extname(f.name).toLowerCase()));
+    const transcriptFile = files.find((f) => TRANSCRIPT_EXTENSIONS.includes(path.extname(f.name).toLowerCase()));
+
+    if (!videoFile) {
+      throw new Error(`No video file found at URL. Found: ${files.map((f) => f.name).join(", ") || "nothing"}`);
+    }
+
+    videoPath = path.join(tempDir, videoFile.name);
+    transcriptPath = transcriptFile ? path.join(tempDir, transcriptFile.name) : null;
+
+    console.error(`Downloading video: ${videoFile.name}`);
+    await downloadResolvedFile(videoFile, videoPath, url);
+
+    if (transcriptFile && transcriptPath) {
+      console.error(`Downloading transcript: ${transcriptFile.name}`);
+      await downloadResolvedFile(transcriptFile, transcriptPath, url);
+    } else {
+      console.error("No transcript found via Graph — will rely on screenshots");
+    }
+  } catch (graphErr) {
+    console.error(`Graph/REST access failed: ${(graphErr as Error).message}`);
+    graphFailed = true;
   }
 
-  const videoPath = path.join(tempDir, videoFile.name);
-  const transcriptPath = transcriptFile ? path.join(tempDir, transcriptFile.name) : null;
+  // Fallback: yt-dlp with browser cookies / cookies file / Bearer token
+  if (graphFailed) {
+    console.error("\n⚠️  Graph API blocked by tenant policy. Trying yt-dlp...");
+    try {
+      const result = downloadViaYtDlp(url, tempDir, token);
+      videoPath = result.videoPath;
+      transcriptPath = result.transcriptPath;
+    } catch (ytErr) {
+      throw new Error(
+        `All download methods failed.\n\n` +
+        `Graph/REST error: ${graphFailed ? "403/401 — tenant policy blocks app access" : "ok"}\n` +
+        `yt-dlp error: ${(ytErr as Error).message}\n\n` +
+        `➡  Manual fallback:\n` +
+        `   1. Download the recording from Teams (.mp4)\n` +
+        `   2. Download the transcript: Teams → ... → Open transcript → Download (.vtt)\n` +
+        `   3. Put both files in one folder\n` +
+        `   4. Use: process_recording_folder({ folder_path: "C:\\\\your\\\\folder" })`
+      );
+    }
+  }
 
-  console.error(`Downloading video: ${videoFile.name}`);
-  await downloadSharePointFile(token, videoFile.downloadUrl, videoPath);
-
-  if (transcriptFile && transcriptPath) {
-    console.error(`Downloading transcript: ${transcriptFile.name}`);
-    await downloadSharePointFile(token, transcriptFile.downloadUrl, transcriptPath);
+  if (!videoPath) {
+    throw new Error("Could not obtain video file. Use process_recording_folder as a fallback.");
   }
 
   return processLocalFiles(videoPath, transcriptPath, url, id, "url");
