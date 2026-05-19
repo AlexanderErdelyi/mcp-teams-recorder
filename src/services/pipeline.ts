@@ -81,15 +81,10 @@ function downloadViaYtDlp(url: string, destDir: string, graphToken?: string): { 
       label: "Bearer token (az login)",
       args: ["--add-headers", `Authorization:Bearer ${graphToken}`],
     });
-    // Also try with a SharePoint-scoped token
-    strategies.push({
-      label: "Bearer token (SharePoint-scoped)",
-      args: ["--add-headers", `Authorization:Bearer ${graphToken}`, "--add-headers", "Accept:application/json"],
-    });
   }
 
-  // 3. Browser cookies (requires browser to be closed)
-  for (const browser of ["edge", "chrome", "firefox", "chromium"]) {
+  // 3. Browser cookies — Firefox first (works even when browser is open), then others
+  for (const browser of ["firefox", "edge", "chrome", "chromium"]) {
     strategies.push({
       label: `${browser} browser cookies`,
       args: ["--cookies-from-browser", browser],
@@ -168,68 +163,60 @@ export async function processRecordingUrl(
   const tenantId = process.env["AZURE_TENANT_ID"];
   const clientId = process.env["AZURE_CLIENT_ID"]; // optional
 
-  console.error("Authenticating with Microsoft Graph...");
-  let token: string;
+  // Try Graph auth — but don't fail hard, yt-dlp browser cookies are the reliable fallback
+  let token: string | null = null;
   try {
+    console.error("Trying Microsoft Graph authentication...");
     token = await getGraphToken(tenantId, clientId ?? undefined);
   } catch (authErr) {
-    throw new Error(
-      `Cannot access SharePoint — authentication failed.\n\n` +
-      `Tried:\n` +
-      `  1. Azure CLI (az login) — not logged in or az not installed\n` +
-      `  2. Device code sign-in — ${tenantId ? "failed" : "AZURE_TENANT_ID not set"}\n` +
-      `  3. App registration — ${clientId ? "failed" : "AZURE_CLIENT_ID not set"}\n\n` +
-      `➡  Plan B (no auth needed):\n` +
-      `   1. Download the recording from Teams manually (.mp4)\n` +
-      `   2. Download the transcript: in Teams → ... → Open transcript → Download (.vtt)\n` +
-      `   3. Put both files in a folder, e.g. C:\\recordings\\my-meeting\\\n` +
-      `   4. Call: process_recording_folder({ folder_path: "C:\\\\recordings\\\\my-meeting" })\n\n` +
-      `Original error: ${(authErr as Error).message}`
-    );
+    console.error(`Graph auth skipped: ${(authErr as Error).message.split("\n")[0]}`);
+    console.error("Will try yt-dlp with browser cookies instead...");
   }
 
   // Download to temp dir
   const tempDir = path.join(os.tmpdir(), `mcp-rec-${id}`);
   fs.mkdirSync(tempDir, { recursive: true });
 
-  // Try Graph/SharePoint REST API first
+  // Try Graph/SharePoint REST API first (only if we have a token)
   let videoPath: string | null = null;
   let transcriptPath: string | null = null;
 
-  let graphFailed = false;
-  try {
-    console.error("Resolving recording files from URL...");
-    const files = await resolveRecordingFiles(token, url);
+  let graphFailed = !token; // skip Graph entirely if no token
+  if (token) {
+    try {
+      console.error("Resolving recording files from URL...");
+      const files = await resolveRecordingFiles(token, url);
 
-    const videoFile = files.find((f) => VIDEO_EXTENSIONS.includes(path.extname(f.name).toLowerCase()));
-    const transcriptFile = files.find((f) => TRANSCRIPT_EXTENSIONS.includes(path.extname(f.name).toLowerCase()));
+      const videoFile = files.find((f) => VIDEO_EXTENSIONS.includes(path.extname(f.name).toLowerCase()));
+      const transcriptFile = files.find((f) => TRANSCRIPT_EXTENSIONS.includes(path.extname(f.name).toLowerCase()));
 
-    if (!videoFile) {
-      throw new Error(`No video file found at URL. Found: ${files.map((f) => f.name).join(", ") || "nothing"}`);
+      if (!videoFile) {
+        throw new Error(`No video file found at URL. Found: ${files.map((f) => f.name).join(", ") || "nothing"}`);
+      }
+
+      videoPath = path.join(tempDir, videoFile.name);
+      transcriptPath = transcriptFile ? path.join(tempDir, transcriptFile.name) : null;
+
+      console.error(`Downloading video: ${videoFile.name}`);
+      await downloadResolvedFile(videoFile, videoPath, url);
+
+      if (transcriptFile && transcriptPath) {
+        console.error(`Downloading transcript: ${transcriptFile.name}`);
+        await downloadResolvedFile(transcriptFile, transcriptPath, url);
+      } else {
+        console.error("No transcript found via Graph — will rely on screenshots");
+      }
+    } catch (graphErr) {
+      console.error(`Graph/REST access failed: ${(graphErr as Error).message}`);
+      graphFailed = true;
     }
-
-    videoPath = path.join(tempDir, videoFile.name);
-    transcriptPath = transcriptFile ? path.join(tempDir, transcriptFile.name) : null;
-
-    console.error(`Downloading video: ${videoFile.name}`);
-    await downloadResolvedFile(videoFile, videoPath, url);
-
-    if (transcriptFile && transcriptPath) {
-      console.error(`Downloading transcript: ${transcriptFile.name}`);
-      await downloadResolvedFile(transcriptFile, transcriptPath, url);
-    } else {
-      console.error("No transcript found via Graph — will rely on screenshots");
-    }
-  } catch (graphErr) {
-    console.error(`Graph/REST access failed: ${(graphErr as Error).message}`);
-    graphFailed = true;
   }
 
-  // Fallback: yt-dlp with browser cookies / cookies file / Bearer token
+  // Fallback: yt-dlp with browser cookies (Firefox works even when open)
   if (graphFailed) {
-    console.error("\n⚠️  Graph API blocked by tenant policy. Trying yt-dlp...");
+    console.error("\n⚠️  Trying yt-dlp with browser cookies (Firefox first)...");
     try {
-      const result = downloadViaYtDlp(url, tempDir, token);
+      const result = downloadViaYtDlp(url, tempDir, token ?? undefined);
       videoPath = result.videoPath;
       transcriptPath = result.transcriptPath;
 

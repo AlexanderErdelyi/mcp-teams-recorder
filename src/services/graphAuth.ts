@@ -12,8 +12,10 @@ const SCOPES = [
   "User.Read",
 ];
 
-// Azure CLI public client ID — pre-consented in every tenant, no app registration needed
-const AZ_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
+// Public client IDs for delegated Graph/SharePoint access (interactive consent)
+// Note: Azure CLI ID (04b07795) cannot request Files.Read.All due to AADSTS65002
+const AZ_CLI_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"; // Azure PowerShell — pre-authorized for Files/Sites
+const AZ_CLI_CLIENT_ID_FALLBACK = "d3590ed6-52b3-4102-aeff-aad2292ab01c"; // Microsoft Office (fallback)
 
 // ── Strategy 1: Azure CLI (az login) ─────────────────────────────────────────
 function tryAzureCliToken(resource = "https://graph.microsoft.com"): string | null {
@@ -38,41 +40,44 @@ export function getSharePointToken(hostname: string): string | null {
   return tryAzureCliToken(`https://${hostname}`);
 }
 
-// ── Strategy 2: MSAL with Azure CLI client ID (browser popup, no app reg needed)
+// ── Strategy 2: MSAL with well-known public client IDs (browser popup, no app reg needed)
 async function tryMsalInteractive(tenantId: string): Promise<string | null> {
-  try {
-    const app = buildMsalApp(tenantId, AZ_CLI_CLIENT_ID);
+  for (const clientId of [AZ_CLI_CLIENT_ID, AZ_CLI_CLIENT_ID_FALLBACK]) {
+    try {
+      const app = buildMsalApp(tenantId, clientId);
 
-    // Try silent cache first
-    const accounts = await app.getTokenCache().getAllAccounts();
-    if (accounts.length > 0 && accounts[0]) {
-      try {
-        const result: AuthenticationResult = await app.acquireTokenSilent({
-          account: accounts[0],
-          scopes: SCOPES,
-        });
-        console.error("✅ Using cached MSAL token");
-        return result.accessToken;
-      } catch { /* fall through */ }
+      // Try silent cache first
+      const accounts = await app.getTokenCache().getAllAccounts();
+      if (accounts.length > 0 && accounts[0]) {
+        try {
+          const result: AuthenticationResult = await app.acquireTokenSilent({
+            account: accounts[0],
+            scopes: SCOPES,
+          });
+          console.error("✅ Using cached MSAL token");
+          return result.accessToken;
+        } catch { /* fall through */ }
+      }
+
+      // Device code flow — user visits a URL and enters a code
+      const result = await app.acquireTokenByDeviceCode({
+        scopes: SCOPES,
+        deviceCodeCallback: (response) => {
+          console.error("\n=== Microsoft Sign-In Required ===");
+          console.error(response.message);
+          console.error("(Same account you use for Teams/SharePoint)");
+          console.error("==================================\n");
+        },
+      });
+
+      if (!result) continue;
+      console.error("✅ Microsoft sign-in successful");
+      return result.accessToken;
+    } catch {
+      continue;
     }
-
-    // Device code flow — user visits a URL and enters a code
-    const result = await app.acquireTokenByDeviceCode({
-      scopes: SCOPES,
-      deviceCodeCallback: (response) => {
-        console.error("\n=== Microsoft Sign-In Required ===");
-        console.error(response.message);
-        console.error("(Same account you use for Teams/SharePoint)");
-        console.error("==================================\n");
-      },
-    });
-
-    if (!result) return null;
-    console.error("✅ Microsoft sign-in successful");
-    return result.accessToken;
-  } catch {
-    return null;
   }
+  return null;
 }
 
 // ── Strategy 3: Custom app registration (optional, if admin provided one) ────
@@ -104,27 +109,29 @@ async function tryMsalCustomApp(tenantId: string, clientId: string): Promise<str
 
 // ── Main: try all strategies in order ────────────────────────────────────────
 export async function getGraphToken(tenantId?: string, clientId?: string): Promise<string> {
-  // 1. Azure CLI (no config needed — just `az login`)
-  const cliToken = tryAzureCliToken();
-  if (cliToken) return cliToken;
-
-  // 2. MSAL with Azure CLI public client ID (no app registration needed)
-  //    Only needs tenantId (or "common" for multi-tenant)
   const effectiveTenant = tenantId ?? "common";
+
+  // 1. MSAL with cached token (silent) — fastest if previously authenticated with npm run auth
+  //    Also triggers device code if no cache. Uses proper Files.Read.All scope.
   const interactiveToken = await tryMsalInteractive(effectiveTenant);
   if (interactiveToken) return interactiveToken;
 
-  // 3. Custom app registration (if AZURE_CLIENT_ID is set)
+  // 2. Custom app registration (if AZURE_CLIENT_ID is set)
   if (clientId) {
     const customToken = await tryMsalCustomApp(effectiveTenant, clientId);
     if (customToken) return customToken;
   }
 
+  // 3. Azure CLI last resort — token may lack Files.Read.All but try anyway
+  const cliToken = tryAzureCliToken();
+  if (cliToken) return cliToken;
+
   throw new Error(
-    "Could not obtain a Microsoft Graph token. Try one of:\n" +
-    "  1. Run 'az login' in your terminal (easiest — no config needed)\n" +
-    "  2. Set AZURE_TENANT_ID in .env and sign in when prompted\n" +
-    "  3. Set AZURE_TENANT_ID + AZURE_CLIENT_ID in .env (requires app registration)"
+    "Could not obtain a Microsoft Graph token.\n\n" +
+    "➡  Run this command to authenticate:\n" +
+    "     cd C:\\VSCodeProjects\\GitHub\\mcp-teams-recorder && npm run auth\n\n" +
+    "   This opens a browser sign-in (device code) and caches the token.\n" +
+    "   After that, process_recording_url will work without further login prompts."
   );
 }
 
