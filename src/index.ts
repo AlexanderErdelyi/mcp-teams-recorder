@@ -11,6 +11,7 @@ import {
   summarizeForDocumentation,
   summarizeForFeedback,
 } from "./services/summarizers";
+import { uploadScreenshotsToAdo, buildAdoAttachmentHtml } from "./services/adoUploader";
 
 const server = new McpServer({
   name: "mcp-teams-recorder",
@@ -415,6 +416,70 @@ Provide a focus hint to control what gets highlighted (e.g. "mark all input fiel
     } catch (err) {
       return {
         content: [{ type: "text" as const, text: JSON.stringify({ error: String(err) }) }],
+      };
+    }
+  }
+);
+
+// ─── Tool: upload_screenshots_to_ado ─────────────────────────────────────────
+server.tool(
+  "upload_screenshots_to_ado",
+  `Upload screenshots from a processed recording to Azure DevOps as work item attachments.
+Returns ADO attachment URLs that can be embedded in work item descriptions, bug reports, or wiki pages.
+The returned adoHtml can be appended to any work item description field.
+The returned adoMarkdown can be pasted into ADO wiki pages.
+
+Required: ADO_PAT and ADO_ORG (or ADO_ORG_URL) and ADO_PROJECT env vars,
+OR pass ado_org, ado_project, and ado_pat directly as parameters.`,
+  {
+    recording_id: z.string().describe("Recording ID from a previous process_recording_* call"),
+    ado_org: z.string().optional().describe("Azure DevOps org name (e.g. 'mycompany') or full URL. Falls back to ADO_ORG / ADO_ORG_URL env var."),
+    ado_project: z.string().optional().describe("Azure DevOps project name. Falls back to ADO_PROJECT env var."),
+    ado_pat: z.string().optional().describe("Azure DevOps Personal Access Token (Work Items Read & Write scope). Falls back to ADO_PAT env var."),
+    max_screenshots: z.number().optional().describe("Max number of screenshots to upload (default: all relevant ones, up to 20)"),
+  },
+  async ({ recording_id, ado_org, ado_project, ado_pat, max_screenshots }) => {
+    const analysis = loadAnalysis(recording_id);
+    if (!analysis) {
+      return { content: [{ type: "text", text: `No analysis found for ID: ${recording_id}` }], isError: true };
+    }
+
+    if (analysis.screenshots.length === 0) {
+      return { content: [{ type: "text", text: "No screenshots available for this recording." }] };
+    }
+
+    try {
+      const uploads = await uploadScreenshotsToAdo(
+        analysis.screenshots,
+        analysis.title,
+        {
+          orgOrUrl: ado_org,
+          project: ado_project,
+          pat: ado_pat,
+          maxScreenshots: max_screenshots ?? 20,
+        }
+      );
+
+      const attachmentHtml = buildAdoAttachmentHtml(uploads);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              recordingId: recording_id,
+              uploadedCount: uploads.length,
+              screenshots: uploads,
+              attachmentHtml,
+              tip: "Append 'attachmentHtml' to the HTML description of a work item. Use adoMarkdown per-screenshot for wiki pages.",
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Upload failed: ${(err as Error).message}` }],
+        isError: true,
       };
     }
   }
