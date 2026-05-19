@@ -264,22 +264,46 @@ async function tryDownloadTranscriptDirectly(
     `${folderPath}/${baseName}_transcript.vtt`,
   ];
 
+  // Strategy 1: SharePoint REST with az token
   for (const vttServerRelPath of vttCandidates) {
     const destPath = path.join(destDir, path.basename(vttServerRelPath));
     try {
-      console.error(`Trying to download transcript: ${vttServerRelPath}`);
+      console.error(`Trying to download transcript via SharePoint token: ${path.basename(vttServerRelPath)}`);
       await downloadWithSharePointToken(info.hostname, vttServerRelPath, destPath);
-      // Verify it looks like a VTT file (not an error HTML page)
       const content = fs.readFileSync(destPath, "utf-8");
-      if (content.includes("WEBVTT") || content.trim().length > 50) {
+      if (content.includes("WEBVTT")) {
         console.error(`✅ Transcript downloaded: ${path.basename(destPath)}`);
         return destPath;
       }
-      fs.unlinkSync(destPath); // delete corrupt file
+      fs.unlinkSync(destPath);
     } catch { /* try next */ }
   }
 
-  console.error("Could not auto-download transcript (SharePoint access restricted). Use inject_transcript to provide it manually.");
+  // Strategy 2: yt-dlp with Firefox cookies — direct file URL download
+  const ytDlpCmd = resolveYtDlp();
+  if (ytDlpCmd) {
+    for (const vttServerRelPath of vttCandidates) {
+      const vttUrl = `https://${info.hostname}${vttServerRelPath}`;
+      const destPath = path.join(destDir, path.basename(vttServerRelPath));
+      for (const browser of ["firefox", "edge", "chrome"]) {
+        try {
+          console.error(`Trying transcript download via ${browser} cookies: ${path.basename(vttServerRelPath)}`);
+          const result = spawnSync(ytDlpCmd, ["--cookies-from-browser", browser, "-o", destPath, vttUrl], {
+            stdio: ["pipe", "pipe", "pipe"], timeout: 30_000
+          });
+          if (result.status === 0 && fs.existsSync(destPath)) {
+            const content = fs.readFileSync(destPath, "utf-8");
+            if (content.includes("WEBVTT")) {
+              console.error(`✅ Transcript downloaded via ${browser} cookies`);
+              return destPath;
+            }
+          }
+        } catch { /* try next */ }
+      }
+    }
+  }
+
+  console.error("Could not auto-download transcript. Use inject_transcript to paste it manually from Teams.");
   return null;
 }
 
