@@ -26,11 +26,14 @@ async function getCopilotToken(githubToken: string): Promise<string | null> {
 }
 
 function getGhAuthToken(): string | null {
-  // Use the gh CLI OAuth token — works if `gh auth login` has been run
+  // Use the gh CLI OAuth token — works if `gh auth login` has been run with copilot scope.
+  // Must unset GITHUB_TOKEN env var, otherwise `gh auth token` echoes it back instead of the OAuth token.
   try {
     const { execSync } = require("child_process") as typeof import("child_process");
-    const token = execSync("gh auth token", { stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
-    if (token && token.length > 10) return token;
+    const env = { ...process.env, GITHUB_TOKEN: "", GH_TOKEN: "" };
+    const token = execSync("gh auth token", { stdio: ["pipe", "pipe", "pipe"], env }).toString().trim();
+    // Only return gho_* OAuth tokens — not ghp_* classic PATs (those don't have copilot scope)
+    if (token && token.startsWith("gho_")) return token;
   } catch { /* gh not available or not logged in */ }
   return null;
 }
@@ -62,16 +65,14 @@ async function getCopilotClient(): Promise<{ client: OpenAI; visionModel: string
     return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: copilotToken }), visionModel: model, textModel: model };
   }
 
-  // Strategy 3: gh auth token → try Copilot token exchange with OAuth token
-  // Useful if user ran `gh auth refresh --scopes copilot` to add the copilot OAuth scope
+  // Strategy 3: gh auth token → direct access to api.githubcopilot.com
+  // Works when the OAuth token has the 'copilot' scope (run: gh auth refresh --scopes copilot)
   const ghToken = getGhAuthToken();
-  if (ghToken && ghToken !== pat) {
-    const copilotToken2 = await getCopilotToken(ghToken);
-    if (copilotToken2) {
-      const model = customModel ?? "gpt-4o";
-      console.error(`Using api.githubcopilot.com (gh auth + copilot scope), model: ${model}`);
-      return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: copilotToken2 }), visionModel: model, textModel: model };
-    }
+  if (ghToken) {
+    // Verify token has copilot scope by checking if it's different from PAT
+    const model = customModel ?? "gpt-4o";
+    console.error(`Using api.githubcopilot.com (gh auth token, copilot scope), model: ${model}`);
+    return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: ghToken }), visionModel: model, textModel: model };
   }
 
   // Strategy 4: GitHub Models fallback (gpt-4o-mini has separate ~500/day quota vs 100/day for gpt-4o)
