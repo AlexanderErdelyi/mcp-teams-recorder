@@ -44,6 +44,7 @@ async function getCopilotClient(): Promise<{ client: OpenAI; visionModel: string
   const clientOpts: ConstructorParameters<typeof OpenAI>[0] & { maxRetries?: number; timeout?: number } = {
     maxRetries: 0,
     timeout: 60_000,
+    defaultHeaders: { "Copilot-Integration-Id": "vscode-chat" },
   };
 
   // Strategy 1: use COPILOT_API_URL override if set
@@ -57,28 +58,26 @@ async function getCopilotClient(): Promise<{ client: OpenAI; visionModel: string
   const copilotToken = await getCopilotToken(pat);
   if (copilotToken) {
     const model = customModel ?? "gpt-4o";
-    console.error(`Using api.githubcopilot.com (Copilot token exchange), model: ${model}`);
+    console.error(`Using api.githubcopilot.com (token exchange), model: ${model}`);
     return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: copilotToken }), visionModel: model, textModel: model };
   }
-  console.error("Copilot token exchange failed — trying gh auth token...");
 
-  // Strategy 3: gh auth token → exchange for Copilot token
+  // Strategy 3: gh auth token → try Copilot token exchange with OAuth token
+  // Useful if user ran `gh auth refresh --scopes copilot` to add the copilot OAuth scope
   const ghToken = getGhAuthToken();
   if (ghToken && ghToken !== pat) {
     const copilotToken2 = await getCopilotToken(ghToken);
     if (copilotToken2) {
       const model = customModel ?? "gpt-4o";
-      console.error(`Using api.githubcopilot.com (gh auth token exchange), model: ${model}`);
+      console.error(`Using api.githubcopilot.com (gh auth + copilot scope), model: ${model}`);
       return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: copilotToken2 }), visionModel: model, textModel: model };
     }
-    const model = customModel ?? "gpt-4o";
-    console.error(`Using api.githubcopilot.com (gh auth token direct), model: ${model}`);
-    return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: ghToken }), visionModel: model, textModel: model };
   }
 
-  // Strategy 4: GitHub Models (needs 'models' PAT permission or classic PAT)
-  const model = customModel ?? "gpt-4o";
-  console.error(`Using models.inference.ai.azure.com (fallback), model: ${model}`);
+  // Strategy 4: GitHub Models fallback (gpt-4o-mini has separate ~500/day quota vs 100/day for gpt-4o)
+  // Note: to unlock Copilot Business API, run: gh auth refresh --scopes copilot
+  const model = customModel ?? "gpt-4o-mini";
+  console.error(`Using models.inference.ai.azure.com (GitHub Models fallback), model: ${model}`);
   return { client: new OpenAI({ ...clientOpts, baseURL: "https://models.inference.ai.azure.com", apiKey: pat }), visionModel: model, textModel: model };
 }
 
@@ -228,15 +227,36 @@ export async function analyzeRecording(
   screenshots: Screenshot[],
   title: string
 ): Promise<RecordingAnalysis["analysis"]> {
-  try {
+  const attempt = async () => {
     const { client, textModel } = await getCopilotClient();
     return await analyzeWithAI(client, textModel, transcript, screenshots, title);
+  };
+
+  try {
+    return await attempt();
   } catch (err) {
     const msg = (err as Error).message ?? "";
-    if (msg.includes("429") || msg.includes("RateLimit") || msg.includes("rate limit")) {
-      console.error("AI rate-limited — generating basic analysis from transcript text.");
-    } else {
+    const isRateLimit = msg.includes("429") || msg.includes("RateLimit") || msg.toLowerCase().includes("rate limit");
+    if (!isRateLimit) {
       console.error("AI analysis failed — falling back to basic analysis:", msg);
+      return buildBasicAnalysis(transcript, screenshots, title);
+    }
+    // Check if this is a per-minute TPM limit (retryable) vs a daily limit (not retryable)
+    const waitMatch = msg.match(/wait (\d+) second/i);
+    const waitSec = waitMatch ? parseInt(waitMatch[1], 10) : 0;
+    if (waitSec > 0 && waitSec <= 120) {
+      // Per-minute TPM limit — wait and retry once
+      console.error(`AI rate-limited (TPM) — retrying in ${waitSec + 2}s...`);
+      await new Promise((r) => setTimeout(r, (waitSec + 2) * 1000));
+      try {
+        return await attempt();
+      } catch (retryErr) {
+        const retryMsg = (retryErr as Error).message ?? "";
+        console.error("AI rate-limited after retry — falling back to basic analysis:", retryMsg.slice(0, 80));
+      }
+    } else {
+      // Daily limit or long wait — no retry
+      console.error(`AI rate-limited (daily limit) — basic analysis only. ${waitSec > 0 ? `(resets in ~${Math.round(waitSec / 3600)}h)` : ""}`);
     }
     return buildBasicAnalysis(transcript, screenshots, title);
   }
@@ -292,16 +312,7 @@ async function analyzeWithAI(
     .map((s) => `[${formatTime(s.start)}] ${s.speaker}: ${s.text}`)
     .join("\n");
 
-  // Build vision content with top 5 screenshots
-  const topScreenshots = screenshots.slice(0, 5);
-  const imageContent: OpenAI.Chat.ChatCompletionContentPart[] = topScreenshots.map((ss) => ({
-    type: "image_url" as const,
-    image_url: {
-      url: `data:image/png;base64,${ss.base64 ?? ""}`,
-      detail: "low" as const,
-    },
-  }));
-
+  // Screenshots are described textually — no need to send images again (saves tokens, avoids double vision rate limit)
   const screenshotDescriptions = screenshots
     .map((s) => `[${formatTime(s.timestamp)}] ${s.description} (tags: ${s.tags.join(", ")})`)
     .join("\n");
@@ -361,20 +372,16 @@ Analyze this recording and respond with ONLY a valid JSON object in this exact f
   "topics": ["<topic1>", "<topic2>"]
 }`;
 
-  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    {
-      role: "user",
-      content: imageContent.length > 0
-        ? [...imageContent, { type: "text" as const, text: prompt }]
-        : prompt,
-    },
-  ];
+  // Try with images first; if vision unsupported (400), retry text-only
+  async function callWithFallback() {
+    return client.chat.completions.create({
+      model: textModel,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 2000,
+    });
+  }
 
-  const response = await client.chat.completions.create({
-    model: textModel,
-    messages,
-    max_tokens: 2000,
-  });
+  const response = await callWithFallback();
 
   const content = response.choices[0]?.message.content ?? "{}";
   const jsonMatch = content.match(/\{[\s\S]*\}/);
