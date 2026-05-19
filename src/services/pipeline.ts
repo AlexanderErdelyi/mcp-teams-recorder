@@ -9,6 +9,7 @@ import { scoreScreenshots } from "./copilotAnalyzer";
 import { analyzeRecording } from "./copilotAnalyzer";
 import { saveAnalysis, loadAnalysis, generateRecordingId } from "./cache";
 import { getGraphToken, resolveRecordingFiles, downloadFromUrl, downloadWithSharePointToken, parseRecordingUrl } from "./graphAuth";
+import { downloadTranscriptViaPlaywright } from "./playwrightTranscriptDownloader";
 
 const VIDEO_EXTENSIONS = [".mp4", ".mkv", ".webm", ".mov", ".avi"];
 const TRANSCRIPT_EXTENSIONS = [".vtt", ".docx"];
@@ -301,6 +302,15 @@ async function tryDownloadTranscriptDirectly(
         } catch { /* try next */ }
       }
     }
+  }
+
+  // Strategy 3: Playwright + Firefox cookies — browse SharePoint folder, find actual VTT name
+  console.error("Trying Playwright + Firefox cookies to browse SharePoint folder…");
+  try {
+    const vttPath = await downloadTranscriptViaPlaywright(originalUrl, destDir);
+    if (vttPath) return vttPath;
+  } catch (err) {
+    console.error("[playwright] Error:", (err as Error).message);
   }
 
   console.error("Could not auto-download transcript. Use inject_transcript to paste it manually from Teams.");
