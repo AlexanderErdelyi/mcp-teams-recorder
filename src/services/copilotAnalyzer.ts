@@ -40,12 +40,17 @@ async function getCopilotClient(): Promise<{ client: OpenAI; visionModel: string
   if (!pat) throw new Error("GITHUB_TOKEN env var required");
 
   const customModel = process.env["COPILOT_MODEL"];
+  // Disable SDK retries so rate-limit 429s fail fast instead of hanging
+  const clientOpts: ConstructorParameters<typeof OpenAI>[0] & { maxRetries?: number; timeout?: number } = {
+    maxRetries: 0,
+    timeout: 60_000,
+  };
 
   // Strategy 1: use COPILOT_API_URL override if set
   const overrideUrl = process.env["COPILOT_API_URL"];
   if (overrideUrl) {
     const model = customModel ?? "gpt-4o";
-    return { client: new OpenAI({ baseURL: overrideUrl, apiKey: pat }), visionModel: model, textModel: model };
+    return { client: new OpenAI({ ...clientOpts, baseURL: overrideUrl, apiKey: pat }), visionModel: model, textModel: model };
   }
 
   // Strategy 2: exchange PAT for Copilot token → use api.githubcopilot.com
@@ -53,7 +58,7 @@ async function getCopilotClient(): Promise<{ client: OpenAI; visionModel: string
   if (copilotToken) {
     const model = customModel ?? "gpt-4o";
     console.error(`Using api.githubcopilot.com (Copilot token exchange), model: ${model}`);
-    return { client: new OpenAI({ baseURL: "https://api.githubcopilot.com", apiKey: copilotToken }), visionModel: model, textModel: model };
+    return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: copilotToken }), visionModel: model, textModel: model };
   }
   console.error("Copilot token exchange failed — trying gh auth token...");
 
@@ -64,86 +69,100 @@ async function getCopilotClient(): Promise<{ client: OpenAI; visionModel: string
     if (copilotToken2) {
       const model = customModel ?? "gpt-4o";
       console.error(`Using api.githubcopilot.com (gh auth token exchange), model: ${model}`);
-      return { client: new OpenAI({ baseURL: "https://api.githubcopilot.com", apiKey: copilotToken2 }), visionModel: model, textModel: model };
+      return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: copilotToken2 }), visionModel: model, textModel: model };
     }
     const model = customModel ?? "gpt-4o";
     console.error(`Using api.githubcopilot.com (gh auth token direct), model: ${model}`);
-    return { client: new OpenAI({ baseURL: "https://api.githubcopilot.com", apiKey: ghToken }), visionModel: model, textModel: model };
+    return { client: new OpenAI({ ...clientOpts, baseURL: "https://api.githubcopilot.com", apiKey: ghToken }), visionModel: model, textModel: model };
   }
 
   // Strategy 4: GitHub Models (needs 'models' PAT permission or classic PAT)
-  // OpenAI-compat SDK uses plain model names (no openai/ prefix)
   const model = customModel ?? "gpt-4o";
   console.error(`Using models.inference.ai.azure.com (fallback), model: ${model}`);
-  return { client: new OpenAI({ baseURL: "https://models.inference.ai.azure.com", apiKey: pat }), visionModel: model, textModel: model };
+  return { client: new OpenAI({ ...clientOpts, baseURL: "https://models.inference.ai.azure.com", apiKey: pat }), visionModel: model, textModel: model };
 }
 
 // Step 1: Score each screenshot for relevance using Copilot Vision
 export async function scoreScreenshots(frames: ExtractedFrame[]): Promise<Screenshot[]> {
-  const { client, visionModel } = await getCopilotClient();
-  const scored: Screenshot[] = [];
+  const existing = frames.filter((f) => fs.existsSync(f.filePath));
+  if (existing.length === 0) return [];
 
-  for (const frame of frames) {
-    if (!fs.existsSync(frame.filePath)) continue;
+  // Load all base64 images upfront
+  const loaded = existing.map((f) => ({
+    frame: f,
+    base64: fs.readFileSync(f.filePath).toString("base64"),
+    ext: path.extname(f.filePath).slice(1) || "png",
+  }));
 
-    const base64 = fs.readFileSync(frame.filePath).toString("base64");
-    const ext = path.extname(frame.filePath).slice(1) || "png";
+  let scored: Screenshot[] = [];
 
-    try {
-      const response = await client.chat.completions.create({
-        model: visionModel,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "image_url",
-                image_url: { url: `data:image/${ext};base64,${base64}`, detail: "low" },
-              },
-              {
-                type: "text",
-                text: `Analyze this screenshot from a screen recording. Respond with JSON only:
-{
-  "relevanceScore": <0.0-1.0, where 1.0 = highly informative UI/content, 0.0 = blank/static/no useful info>,
-  "description": "<one sentence describing what is shown>",
-  "tags": ["<tag1>", "<tag2>"] // e.g. ui, error, diagram, code, dashboard, form, chat, presentation, blank
-}
+  try {
+    const { client, visionModel } = await getCopilotClient();
 
-Be strict: blank screens, loading spinners, or static desktop should score below 0.2.`,
-              },
-            ],
-          },
-        ],
-        max_tokens: 200,
-      });
+    // Batch all images into ONE request — uses 1 API call instead of N
+    const imageContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+    for (let i = 0; i < loaded.length; i++) {
+      const { frame, base64, ext } = loaded[i]!;
+      imageContent.push({
+        type: "image_url",
+        image_url: { url: `data:image/${ext};base64,${base64}`, detail: "low" },
+      } as OpenAI.Chat.Completions.ChatCompletionContentPartImage);
+      imageContent.push({
+        type: "text",
+        text: `Image ${i + 1} (timestamp: ${Math.round(frame.timestamp)}s)`,
+      } as OpenAI.Chat.Completions.ChatCompletionContentPartText);
+    }
+    imageContent.push({
+      type: "text",
+      text: `You have been shown ${loaded.length} screenshots from a screen recording in chronological order.
+For each image, respond with a JSON array entry. Return ONLY a JSON array, no other text:
+[
+  { "i": 1, "relevanceScore": 0.0-1.0, "description": "one sentence", "tags": ["tag1","tag2"] },
+  ...
+]
+relevanceScore: 1.0 = highly informative UI/content, 0.0 = blank/loading/static.
+Tags examples: ui, form, error, dashboard, code, chat, presentation, blank, settings.
+Be strict: blank screens and loading spinners score below 0.2.`,
+    } as OpenAI.Chat.Completions.ChatCompletionContentPartText);
 
-      const content = response.choices[0]?.message.content ?? "{}";
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    const response = await client.chat.completions.create({
+      model: visionModel,
+      messages: [{ role: "user", content: imageContent }],
+      max_tokens: 100 * loaded.length,
+    });
 
-      scored.push({
+    const content = response.choices[0]?.message.content ?? "[]";
+    const arrMatch = content.match(/\[[\s\S]*\]/);
+    const results: Array<{ i: number; relevanceScore: number; description: string; tags: string[] }> =
+      arrMatch ? JSON.parse(arrMatch[0]) : [];
+
+    const resultMap = new Map(results.map((r) => [r.i, r]));
+    scored = loaded.map(({ frame, base64 }, idx) => {
+      const r = resultMap.get(idx + 1);
+      return {
         id: `ss_${Math.round(frame.timestamp * 1000)}`,
         timestamp: frame.timestamp,
         filePath: frame.filePath,
         base64,
-        relevanceScore: parsed.relevanceScore ?? 0.5,
-        description: parsed.description ?? "Screenshot",
-        tags: parsed.tags ?? [],
-      });
-    } catch (err) {
-      // If vision fails for a frame, include it with neutral score
-      scored.push({
-        id: `ss_${Math.round(frame.timestamp * 1000)}`,
-        timestamp: frame.timestamp,
-        filePath: frame.filePath,
-        relevanceScore: 0.5,
-        description: "Screenshot (analysis unavailable)",
-        tags: [],
-      });
-    }
+        relevanceScore: r?.relevanceScore ?? 0.5,
+        description: r?.description ?? "Screenshot",
+        tags: r?.tags ?? [],
+      };
+    });
+  } catch (err) {
+    // Vision unavailable — include all with neutral score (text analysis still runs)
+    console.error("Vision scoring unavailable, using neutral scores:", (err as Error).message);
+    scored = loaded.map(({ frame, base64 }) => ({
+      id: `ss_${Math.round(frame.timestamp * 1000)}`,
+      timestamp: frame.timestamp,
+      filePath: frame.filePath,
+      base64,
+      relevanceScore: 0.5,
+      description: "Screenshot (vision scoring unavailable)",
+      tags: [],
+    }));
   }
 
-  // Filter low-relevance, deduplicate visually similar screens, cap at 20
   const filtered = scored.filter((s) => s.relevanceScore >= 0.3);
   return deduplicateScreenshots(filtered).slice(0, 20);
 }
@@ -209,8 +228,66 @@ export async function analyzeRecording(
   screenshots: Screenshot[],
   title: string
 ): Promise<RecordingAnalysis["analysis"]> {
-  const { client, textModel } = await getCopilotClient();
+  try {
+    const { client, textModel } = await getCopilotClient();
+    return await analyzeWithAI(client, textModel, transcript, screenshots, title);
+  } catch (err) {
+    const msg = (err as Error).message ?? "";
+    if (msg.includes("429") || msg.includes("RateLimit") || msg.includes("rate limit")) {
+      console.error("AI rate-limited — generating basic analysis from transcript text.");
+    } else {
+      console.error("AI analysis failed — falling back to basic analysis:", msg);
+    }
+    return buildBasicAnalysis(transcript, screenshots, title);
+  }
+}
 
+// Basic analysis built from transcript text without any AI — always works
+function buildBasicAnalysis(
+  transcript: TranscriptSegment[],
+  screenshots: Screenshot[],
+  title: string
+): RecordingAnalysis["analysis"] {
+  const speakers = [...new Set(transcript.map((s) => s.speaker).filter(Boolean))];
+  const words = transcript.map((s) => s.text).join(" ");
+  const wordCount = words.split(/\s+/).length;
+
+  // Extract sentences as rough key points (first sentence of each speaker block)
+  const keyPoints: string[] = [];
+  let lastSpeaker = "";
+  for (const seg of transcript) {
+    if (seg.speaker !== lastSpeaker && seg.text.trim().length > 20) {
+      keyPoints.push(`[${formatTime(seg.start)}] ${seg.speaker}: ${seg.text.trim().slice(0, 100)}`);
+      lastSpeaker = seg.speaker;
+      if (keyPoints.length >= 10) break;
+    }
+  }
+
+  const summary = `Recording "${title}" — ${Math.round(wordCount / 130)} minute(s) of speech from ${speakers.join(", ") || "unknown speaker(s)"}. `
+    + `Transcript contains ${transcript.length} segments. `
+    + `AI analysis unavailable (API rate limit reached — will work again tomorrow or configure COPILOT_API_URL).`;
+
+  return {
+    summary,
+    humanReadableSummary: `• Recording: ${title}\n• Speakers: ${speakers.join(", ") || "N/A"}\n• Segments: ${transcript.length}\n• Note: AI analysis unavailable — raw transcript available in result.raw.transcriptText`,
+    keyPoints,
+    issues: [],
+    features: [],
+    decisions: [],
+    actionItems: [],
+    speakers,
+    sentiment: "neutral",
+    topics: [],
+  };
+}
+
+async function analyzeWithAI(
+  client: OpenAI,
+  textModel: string,
+  transcript: TranscriptSegment[],
+  screenshots: Screenshot[],
+  title: string
+): Promise<RecordingAnalysis["analysis"]> {
   const transcriptText = transcript
     .map((s) => `[${formatTime(s.start)}] ${s.speaker}: ${s.text}`)
     .join("\n");
@@ -229,7 +306,6 @@ export async function analyzeRecording(
     .map((s) => `[${formatTime(s.timestamp)}] ${s.description} (tags: ${s.tags.join(", ")})`)
     .join("\n");
 
-  // Use full transcript — no truncation for typical meeting lengths (up to 15000 chars)
   const transcriptExcerpt = transcriptText.slice(0, 15000);
   const hasTranscript = transcriptExcerpt.trim().length > 0;
 
@@ -237,8 +313,7 @@ export async function analyzeRecording(
 
 Title: ${title}
 
-${hasTranscript ? `Full Transcript:
-${transcriptExcerpt}` : "No transcript available — analyze from screenshots only."}
+${hasTranscript ? `Full Transcript:\n${transcriptExcerpt}` : "No transcript available — analyze from screenshots only."}
 
 Screenshot descriptions:
 ${screenshotDescriptions || "No screenshots available."}
@@ -305,7 +380,6 @@ Analyze this recording and respond with ONLY a valid JSON object in this exact f
   const jsonMatch = content.match(/\{[\s\S]*\}/);
   const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
 
-  // Attach screenshot IDs to issues/features that reference them
   const issuesWithScreenshots = (parsed.issues ?? []).map((issue: RecordingAnalysis["analysis"]["issues"][0]) => ({
     ...issue,
     screenshotIds: screenshots
@@ -320,6 +394,7 @@ Analyze this recording and respond with ONLY a valid JSON object in this exact f
       .map((s) => s.id),
   }));
 
+
   return {
     summary: parsed.summary ?? "",
     humanReadableSummary: parsed.humanReadableSummary ?? parsed.summary ?? "",
@@ -333,6 +408,7 @@ Analyze this recording and respond with ONLY a valid JSON object in this exact f
     topics: parsed.topics ?? [],
   };
 }
+
 
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);

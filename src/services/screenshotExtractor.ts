@@ -18,9 +18,11 @@ export interface ExtractedFrame {
 
 export interface ExtractionOptions {
   outputDir?: string;
-  sceneChangeThreshold?: number;  // 0-1, default 0.3
-  segmentBoundaries?: boolean;    // extract at each transcript segment
+  sceneChangeThreshold?: number;  // 0-1, default 0.4
+  segmentBoundaries?: boolean;    // extract at sampled transcript segment boundaries
   intervalSeconds?: number;       // fallback interval if no transcript
+  maxScreenshots?: number;        // hard cap, default 25
+  minSpacingSeconds?: number;     // min seconds between sampled frames, default 45
 }
 
 // Main extraction function
@@ -30,61 +32,69 @@ export async function extractScreenshots(
   options: ExtractionOptions = {}
 ): Promise<ExtractedFrame[]> {
   const {
-    sceneChangeThreshold = 0.3,
+    sceneChangeThreshold = 0.4,
     segmentBoundaries = true,
-    intervalSeconds = 30,
+    intervalSeconds = 60,
+    maxScreenshots = 25,
+    minSpacingSeconds = 45,
   } = options;
 
   const outputDir = options.outputDir ?? path.join(os.tmpdir(), `mcp-screenshots-${Date.now()}`);
   fs.mkdirSync(outputDir, { recursive: true });
 
-  const frames: ExtractedFrame[] = [];
+  let timestamps: number[];
 
-  // 1. Extract at transcript segment boundaries
   if (segmentBoundaries && segments.length > 0) {
-    const timestamps = getUniqueTimestamps(segments);
-    for (const ts of timestamps) {
+    timestamps = sampleTimestamps(segments, maxScreenshots, minSpacingSeconds);
+  } else {
+    const duration = await getVideoDuration(videoPath);
+    timestamps = [];
+    for (let ts = 0; ts < duration; ts += intervalSeconds) timestamps.push(ts);
+  }
+
+  // Cap total
+  if (timestamps.length > maxScreenshots) {
+    timestamps = timestamps.slice(0, maxScreenshots);
+  }
+
+  console.log(`Extracting ${timestamps.length} frames (from ${segments.length} segments)...`);
+
+  // Extract in parallel batches of 4
+  const frames: ExtractedFrame[] = [];
+  const BATCH = 4;
+  for (let i = 0; i < timestamps.length; i += BATCH) {
+    const batch = timestamps.slice(i, i + BATCH);
+    const results = await Promise.all(batch.map(async (ts) => {
       const filePath = path.join(outputDir, `seg_${Math.round(ts * 1000)}.png`);
       await extractFrame(videoPath, ts, filePath);
-      frames.push({ timestamp: ts, filePath, reason: "segment_boundary" });
-    }
-  } else {
-    // Fallback: extract at regular intervals
-    const duration = await getVideoDuration(videoPath);
-    for (let ts = 0; ts < duration; ts += intervalSeconds) {
-      const filePath = path.join(outputDir, `interval_${Math.round(ts)}.png`);
-      await extractFrame(videoPath, ts, filePath);
-      frames.push({ timestamp: ts, filePath, reason: "interval" });
+      return { timestamp: ts, filePath, reason: "segment_boundary" as const };
+    }));
+    frames.push(...results);
+  }
+
+  // Only run scene detection if we have fewer than half the cap
+  if (frames.length < maxScreenshots / 2) {
+    const sceneFrames = await detectSceneChanges(videoPath, outputDir, sceneChangeThreshold);
+    for (const sf of sceneFrames) {
+      if (frames.length >= maxScreenshots) break;
+      const alreadyCovered = frames.some((f) => Math.abs(f.timestamp - sf.timestamp) < minSpacingSeconds);
+      if (!alreadyCovered) frames.push(sf);
     }
   }
 
-  // 2. Add scene-change frames via ffmpeg scene detection
-  const sceneFrames = await detectSceneChanges(videoPath, outputDir, sceneChangeThreshold);
-  for (const sf of sceneFrames) {
-    // Only add if not already covered by a segment boundary within 2 seconds
-    const alreadyCovered = frames.some((f) => Math.abs(f.timestamp - sf.timestamp) < 2);
-    if (!alreadyCovered) {
-      frames.push(sf);
-    }
-  }
-
-  // Sort by timestamp
   frames.sort((a, b) => a.timestamp - b.timestamp);
-
-  // Remove frames where the file doesn't exist (extraction may have failed at edge of video)
   return frames.filter((f) => fs.existsSync(f.filePath));
 }
 
 // Extract a single frame at a given timestamp
 async function extractFrame(videoPath: string, timestamp: number, outputPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     ffmpeg(videoPath)
       .seekInput(timestamp)
       .frames(1)
       .output(outputPath)
       .on("end", () => resolve())
       .on("error", (err) => {
-        // Don't reject on individual frame failures — just skip
         console.warn(`Frame extraction warning at ${timestamp}s: ${err.message}`);
         resolve();
       })
@@ -104,11 +114,10 @@ async function detectSceneChanges(
 
     ffmpeg(videoPath)
       .videoFilters(`select='gt(scene,${threshold})',showinfo`)
-      .frames(50)       // cap at 50 scene-change frames
+      .frames(20)       // cap at 20 scene-change frames
       .output(path.join(outputDir, "scene_%04d.png"))
       .on("stderr", (line: string) => { stderr += line + "\n"; })
       .on("end", () => {
-        // Parse showinfo output for timestamps — e.g. "pts_time:12.345"
         const matches = [...stderr.matchAll(/pts_time:([\d.]+)/g)];
         let i = 1;
         for (const match of matches) {
@@ -121,7 +130,7 @@ async function detectSceneChanges(
         }
         resolve(frames);
       })
-      .on("error", () => resolve([])) // scene detection is best-effort
+      .on("error", () => resolve([]))
       .run();
   });
 }
@@ -136,18 +145,31 @@ function getVideoDuration(videoPath: string): Promise<number> {
   });
 }
 
-// Deduplicate and sample segment boundary timestamps
-function getUniqueTimestamps(segments: TranscriptSegment[]): number[] {
-  const seen = new Set<number>();
-  const result: number[] = [];
-  for (const seg of segments) {
-    const ts = Math.round(seg.start);
-    if (!seen.has(ts)) {
-      seen.add(ts);
+/**
+ * Sample up to `maxCount` timestamps from segments,
+ * ensuring at least `minSpacingSeconds` between consecutive picks.
+ */
+function sampleTimestamps(
+  segments: TranscriptSegment[],
+  maxCount: number,
+  minSpacingSeconds: number
+): number[] {
+  // Collect unique second-level timestamps from segment starts
+  const all = [...new Set(segments.map((s) => Math.round(s.start)))].sort((a, b) => a - b);
+
+  if (all.length === 0) return [];
+
+  // Always include first
+  const result: number[] = [all[0]!];
+
+  for (const ts of all) {
+    if (result.length >= maxCount) break;
+    const last = result[result.length - 1]!;
+    if (ts - last >= minSpacingSeconds) {
       result.push(ts);
     }
   }
+
   return result;
 }
-
 

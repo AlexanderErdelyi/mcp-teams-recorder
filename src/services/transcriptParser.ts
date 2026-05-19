@@ -6,27 +6,43 @@ import type { TranscriptSegment } from "../types/index";
 // Parse WebVTT (.vtt) transcript into segments
 export function parseVtt(content: string): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
-  // Normalize line endings before splitting
-  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const blocks = normalized.split(/\n\n+/).filter((b) => b.trim());
+  // Normalize line endings
+  const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
-  for (const block of blocks) {
-    const lines = block.trim().split("\n");
-    // Find the timestamp line: 00:00:01.000 --> 00:00:05.000
-    const timeLine = lines.find((l) => l.includes("-->"));
-    if (!timeLine) continue;
+  // Teams VTT may have cue IDs concatenated with </v> on the same line, no blank lines between cues.
+  // Strategy: find each timestamp line, then read the cue text line(s) below it.
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (!line.includes("-->")) continue;
 
-    const [startStr, endStr] = timeLine.split("-->").map((s) => s.trim());
-    const start = vttTimeToSeconds(startStr);
-    const end = vttTimeToSeconds(endStr);
+    // Timestamp line
+    const [startStr, endStr] = line.split("-->").map((s) => s.trim());
+    const start = vttTimeToSeconds(startStr ?? "");
+    const end = vttTimeToSeconds(endStr?.split(/\s/)[0] ?? "");
 
-    // Remaining lines are cue text — may include <v Speaker>text</v>
-    const textLines = lines.filter((l) => !l.includes("-->") && !/^\d+$/.test(l.trim()));
-    const rawText = textLines.join(" ").trim();
+    // Collect cue text lines below the timestamp (until next timestamp or end)
+    const cueLines: string[] = [];
+    let j = i + 1;
+    while (j < lines.length && !lines[j]!.includes("-->")) {
+      cueLines.push(lines[j]!);
+      j++;
+    }
 
-    const speakerMatch = rawText.match(/^<v ([^>]+)>(.*)<\/v>$/s);
-    const speaker = speakerMatch ? speakerMatch[1].trim() : "Unknown";
-    const text = speakerMatch ? speakerMatch[2].trim() : rawText.replace(/<[^>]+>/g, "").trim();
+    // Join and clean: strip cue IDs (UUID-like patterns) from beginning/end of lines
+    const rawText = cueLines
+      .join(" ")
+      .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[\d-]+\b/gi, "")
+      .replace(/^WEBVTT\s*/i, "")
+      .trim();
+
+    if (!rawText) continue;
+
+    // Extract speaker from <v Speaker>text</v> format
+    const speakerMatch = rawText.match(/^<v ([^>]+)>([\s\S]*?)<\/v>/);
+    const speaker = speakerMatch ? speakerMatch[1]!.trim() : "Unknown";
+    const text = speakerMatch
+      ? speakerMatch[2]!.trim()
+      : rawText.replace(/<[^>]+>/g, "").trim();
 
     if (text) {
       segments.push({ start, end, speaker, text });
