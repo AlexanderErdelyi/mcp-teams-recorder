@@ -304,16 +304,21 @@ async function tryDownloadTranscriptDirectly(
     }
   }
 
-  // Strategy 3: Playwright + Firefox cookies — browse SharePoint folder, find actual VTT name
-  console.error("Trying Playwright + Firefox cookies to browse SharePoint folder…");
+  // Strategy 3: Firefox cookies + SharePoint REST — lists the actual folder, finds VTT by name
+  console.error("Trying Firefox cookies + SharePoint REST to browse folder…");
   try {
     const vttPath = await downloadTranscriptViaPlaywright(originalUrl, destDir);
     if (vttPath) return vttPath;
   } catch (err) {
-    console.error("[playwright] Error:", (err as Error).message);
+    console.error("[cookies] Error:", (err as Error).message);
   }
 
-  console.error("Could not auto-download transcript. Use inject_transcript to paste it manually from Teams.");
+  console.error(
+    "No VTT transcript found.\n" +
+    "This is usually because meeting transcription was not enabled during recording.\n" +
+    "To fix: In Teams → Settings → Transcription → turn on 'Automatically start transcription'.\n" +
+    "For this recording, use: inject_transcript (paste the auto-summary from Teams)."
+  );
   return null;
 }
 

@@ -1,21 +1,21 @@
 /**
- * Playwright-based Teams transcript downloader
+ * Teams transcript downloader using Firefox cookie extraction
  *
  * Strategy:
  *   1. Extract Firefox cookies from its SQLite DB (works even while Firefox is open)
- *   2. Launch a headless system browser (Edge/Chrome) via playwright-core
- *   3. Inject cookies so the browser is authenticated against SharePoint
- *   4. Call SharePoint REST API to LIST the Recordings folder → find the VTT
- *   5. Download it via authenticated fetch inside the browser context
+ *   2. Use Node.js HTTPS (same as yt-dlp) to call SharePoint REST API
+ *   3. LIST the Recordings folder to find the actual VTT filename
+ *   4. Download the VTT with authenticated request
  *
- * Why Playwright instead of plain HTTPS?
- *   SharePoint sometimes requires browser-like request context (handles CSRF challenges,
- *   302 redirects with cookie updates, etc.). Running inside a real browser avoids all that.
+ * Playwright is used as a fallback if HTTPS requests fail (e.g. for CSRF-protected
+ * endpoints) — the headless Edge/Chrome browser with injected cookies is then used.
  */
 
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as https from "https";
+import * as http from "http";
 import Database from "better-sqlite3";
 import { parseRecordingUrl } from "./graphAuth";
 
@@ -74,26 +74,86 @@ function extractFirefoxCookies(hostname: string): MozCookie[] {
     if (fs.existsSync(cookiesDb + "-shm")) fs.copyFileSync(cookiesDb + "-shm", tmpShm);
 
     const db = new Database(tmpDb, { readonly: true, fileMustExist: true });
-    // Match both exact hostname and leading-dot variant (.sharepoint.com)
+    // Extract parent domain: cosmo365-my.sharepoint.com → sharepoint.com
+    const parts = hostname.split(".");
+    const parentDomain = parts.slice(-2).join(".");
+
+    // Match specific host, its dot-prefixed variant, and the parent domain (e.g. .sharepoint.com)
     const rows = db
       .prepare(
         `SELECT name, value, host, path, isSecure, isHttpOnly, expiry
          FROM moz_cookies
-         WHERE host = ? OR host = ? OR host LIKE ?`
+         WHERE host = ? OR host = ?
+            OR host = ? OR host = ?
+            OR host LIKE ?`
       )
-      .all(hostname, `.${hostname}`, `%.${hostname}`) as MozCookie[];
+      .all(
+        hostname, `.${hostname}`,
+        parentDomain, `.${parentDomain}`,
+        `%.${parentDomain}`
+      ) as MozCookie[];
     db.close();
 
-    console.error(`[playwright] Extracted ${rows.length} Firefox cookies for ${hostname}`);
+    console.error(`[cookies] Extracted ${rows.length} Firefox cookies for ${hostname}`);
     return rows;
   } catch (err) {
-    console.error("[playwright] Error reading Firefox cookies:", err);
+    console.error("[cookies] Error reading Firefox cookies:", err);
     return [];
   } finally {
     try { fs.unlinkSync(tmpDb); } catch { /* ignore */ }
     try { fs.unlinkSync(tmpWal); } catch { /* ignore */ }
     try { fs.unlinkSync(tmpShm); } catch { /* ignore */ }
   }
+}
+
+// ── Node.js HTTPS helper (same approach as yt-dlp — just send cookies in header) ──
+
+function httpsGet(
+  url: string,
+  headers: Record<string, string>,
+  maxRedirects = 5
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const follow = (location: string, remaining: number) => {
+      if (remaining <= 0) { reject(new Error("Too many redirects")); return; }
+      const parsed = new URL(location);
+      const mod = parsed.protocol === "https:" ? https : http;
+      const req = mod.get(
+        {
+          hostname: parsed.hostname,
+          port: parsed.port || undefined,
+          path: parsed.pathname + parsed.search,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ...headers,
+          },
+        },
+        (res) => {
+          if (
+            res.statusCode &&
+            res.statusCode >= 300 &&
+            res.statusCode < 400 &&
+            res.headers.location
+          ) {
+            // Follow redirect, but keep cookies
+            follow(
+              res.headers.location.startsWith("http")
+                ? res.headers.location
+                : `${parsed.protocol}//${parsed.host}${res.headers.location}`,
+              remaining - 1
+            );
+            return;
+          }
+          let body = "";
+          res.on("data", (chunk) => (body += chunk));
+          res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+        }
+      );
+      req.on("error", reject);
+    };
+    follow(url, maxRedirects);
+  });
 }
 
 // ── System browser detection (playwright-core needs an executablePath) ───────
@@ -132,26 +192,110 @@ export async function downloadTranscriptViaPlaywright(
 ): Promise<string | null> {
   const info = parseRecordingUrl(recordingUrl);
   if (!info.hostname || !info.filePath) {
-    console.error("[playwright] Could not parse recording URL");
+    console.error("[cookies] Could not parse recording URL");
     return null;
   }
 
-  // Step 1: Extract Firefox cookies for this SharePoint hostname
+  // Step 1: Extract Firefox cookies
   const mozCookies = extractFirefoxCookies(info.hostname);
   if (mozCookies.length === 0) {
-    console.error("[playwright] No cookies found — cannot authenticate via browser cookies");
+    console.error("[cookies] No Firefox cookies found for SharePoint — is Firefox logged in?");
     return null;
   }
 
-  // Step 2: Find a system Chromium-based browser
+  // Build a flat Cookie header (same as yt-dlp)
+  const cookieHeader = mozCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+
+  // Step 2: Build SharePoint REST URL
+  // _api/web must be scoped to the personal OneDrive site, not the tenant root
+  const folderPath = info.filePath.substring(0, info.filePath.lastIndexOf("/"));
+  const personalSiteMatch = info.filePath.match(/^(\/personal\/[^/]+)/);
+  const sitePath = personalSiteMatch ? personalSiteMatch[1] : "";
+
+  const restUrl =
+    `https://${info.hostname}${sitePath}/_api/web/` +
+    `GetFolderByServerRelativeUrl('${folderPath}')/Files` +
+    `?$select=Name,ServerRelativeUrl&$orderby=Name`;
+
+  console.error(`[cookies] Calling SharePoint REST: ${restUrl}`);
+
+  // Step 3: Try plain HTTPS first (same approach as yt-dlp — cookies in header)
+  const listResult = await httpsGet(restUrl, {
+    Cookie: cookieHeader,
+    Accept: "application/json;odata=verbose",
+    "X-Requested-With": "XMLHttpRequest",
+  }).catch((err) => {
+    console.error(`[cookies] HTTPS request failed: ${err.message}`);
+    return null;
+  });
+
+  let allFiles: SharePointFile[] = [];
+
+  if (listResult && listResult.status === 200) {
+    try {
+      const data = JSON.parse(listResult.body) as Record<string, unknown>;
+      const d = data?.d as Record<string, unknown> | undefined;
+      allFiles = (d?.results ?? []) as SharePointFile[];
+      console.error(`[cookies] HTTPS success — files: ${allFiles.map((f) => f.Name).join(", ")}`);
+    } catch {
+      console.error("[cookies] Could not parse REST response as JSON");
+    }
+  } else {
+    console.error(`[cookies] HTTPS returned HTTP ${listResult?.status} — trying Playwright fallback…`);
+    // Step 3b: Playwright fallback — headless Edge/Chrome with injected cookies
+    allFiles = await listFolderViaPlaywright(info.hostname, restUrl, mozCookies) ?? [];
+  }
+
+  if (allFiles.length === 0) {
+    console.error("[cookies] Could not list Recordings folder via any method");
+    return null;
+  }
+
+  // Step 4: Find the matching VTT file
+  const baseName = path.basename(info.filePath, path.extname(info.filePath));
+  const vttFiles = allFiles.filter((f) => f.Name.toLowerCase().endsWith(".vtt"));
+
+  if (vttFiles.length === 0) {
+    console.error("[cookies] No .vtt files in folder. All files:", allFiles.map((f) => f.Name).join(", "));
+    return null;
+  }
+
+  const exactMatch = vttFiles.find((f) => f.Name.replace(/\.vtt$/i, "") === baseName);
+  const partialMatch = vttFiles.find(
+    (f) => f.Name.includes(baseName) || baseName.includes(f.Name.replace(/\.vtt$/i, ""))
+  );
+  const targetFile = exactMatch ?? partialMatch ?? vttFiles[0];
+  console.error(`[cookies] Using VTT file: ${targetFile.Name}`);
+
+  // Step 5: Download the VTT
+  const vttUrl = `https://${info.hostname}${targetFile.ServerRelativeUrl}`;
+  const vttResult = await httpsGet(vttUrl, { Cookie: cookieHeader }).catch(() => null);
+
+  if (!vttResult || vttResult.status !== 200 || !vttResult.body.includes("WEBVTT")) {
+    console.error("[cookies] VTT download failed or content is not WEBVTT");
+    return null;
+  }
+
+  const destPath = path.join(destDir, targetFile.Name);
+  fs.writeFileSync(destPath, vttResult.body, "utf-8");
+  console.error(`[cookies] ✅ Transcript downloaded: ${targetFile.Name}`);
+  return destPath;
+}
+
+// ── Playwright fallback — used only when HTTPS requests fail ─────────────────
+
+async function listFolderViaPlaywright(
+  hostname: string,
+  restUrl: string,
+  mozCookies: MozCookie[]
+): Promise<SharePointFile[] | null> {
   const executablePath = findSystemBrowserPath();
   if (!executablePath) {
-    console.error("[playwright] No system Chromium/Edge/Chrome found");
+    console.error("[playwright] No system Edge/Chrome found");
     return null;
   }
   console.error(`[playwright] Using browser: ${executablePath}`);
 
-  // Lazy-require playwright-core to avoid startup cost when not needed
   let chromium: typeof import("playwright-core").chromium;
   try {
     ({ chromium } = await import("playwright-core") as typeof import("playwright-core"));
@@ -164,110 +308,44 @@ export async function downloadTranscriptViaPlaywright(
   try {
     const context = await browser.newContext();
 
-    // Step 3: Inject Firefox cookies into the Playwright browser context
-    const playwrightCookies = mozCookies.map((c) => ({
-      name: c.name,
-      value: c.value,
-      domain: c.host.startsWith(".") ? c.host.slice(1) : c.host,
-      path: c.path || "/",
-      secure: c.isSecure === 1,
-      httpOnly: c.isHttpOnly === 1,
-      expires: c.expiry || -1,
-      sameSite: "None" as const,
-    }));
+    const playwrightCookies = mozCookies
+      .filter((c) => c.name && c.value)
+      .map((c) => {
+        const expiresRaw = Number(c.expiry);
+        // Firefox stores expiry in milliseconds; Playwright needs seconds
+        const expiresSeconds = (Number.isFinite(expiresRaw) && expiresRaw > 0)
+          ? Math.floor(expiresRaw / 1000)
+          : -1;
+        return {
+          name: c.name,
+          value: c.value,
+          domain: c.host.startsWith(".") ? c.host.slice(1) : c.host,
+          path: c.path || "/",
+          secure: c.isSecure === 1,
+          httpOnly: c.isHttpOnly === 1,
+          expires: expiresSeconds,
+          sameSite: (c.isSecure === 1 ? "None" : "Lax") as "None" | "Lax",
+        };
+      });
     await context.addCookies(playwrightCookies);
 
-    const page = await context.newPage();
+    const apiResp = await context.request.get(restUrl, {
+      headers: {
+        Accept: "application/json;odata=verbose",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+    });
 
-    // Step 4: List the SharePoint folder via REST API (called from inside the browser)
-    const folderPath = info.filePath.substring(0, info.filePath.lastIndexOf("/"));
-    const restUrl =
-      `https://${info.hostname}/_api/web/` +
-      `GetFolderByServerRelativeUrl('${encodeURIComponent(folderPath)}')/Files` +
-      `?$select=Name,ServerRelativeUrl&$orderby=Name`;
-
-    console.error(`[playwright] Listing folder: ${folderPath}`);
-
-    // Navigate to a SharePoint page first to establish the session context
-    await page.goto(`https://${info.hostname}/_layouts/15/nativehr.aspx`, {
-      waitUntil: "domcontentloaded",
-      timeout: 15_000,
-    }).catch(() => { /* ignore — just warming up cookies */ });
-
-    const listResult = await page.evaluate(async (url: string) => {
-      try {
-        const resp = await fetch(url, {
-          headers: { Accept: "application/json;odata=verbose" },
-          credentials: "include",
-        });
-        if (!resp.ok) return { ok: false, status: resp.status, files: [] };
-        const data = await resp.json() as Record<string, unknown>;
-        const d = data?.d as Record<string, unknown> | undefined;
-        const results = (d?.results ?? []) as { Name: string; ServerRelativeUrl: string }[];
-        return { ok: true, status: resp.status, files: results };
-      } catch (e) {
-        return { ok: false, status: 0, files: [], error: String(e) };
-      }
-    }, restUrl);
-
-    console.error(
-      `[playwright] Folder list result: HTTP ${listResult.status}, ${listResult.files.length} files`
-    );
-
-    if (!listResult.ok) {
-      console.error(`[playwright] Folder listing failed (HTTP ${listResult.status})`);
-      // Still log what files came back if any
+    console.error(`[playwright] REST response: HTTP ${apiResp.status()}`);
+    if (!apiResp.ok()) {
+      const body = await apiResp.text().catch(() => "");
+      console.error(`[playwright] REST error: ${body.substring(0, 200)}`);
       return null;
     }
 
-    const allFiles: SharePointFile[] = listResult.files;
-    console.error(`[playwright] Files in folder: ${allFiles.map((f) => f.Name).join(", ")}`);
-
-    // Step 5: Find the matching VTT file
-    const baseName = path.basename(info.filePath, path.extname(info.filePath));
-    const vttFiles = allFiles.filter((f) => f.Name.toLowerCase().endsWith(".vtt"));
-
-    if (vttFiles.length === 0) {
-      console.error("[playwright] No .vtt files found in folder");
-      return null;
-    }
-
-    // Prefer exact name match; fall back to partial match; then any VTT
-    const exactMatch = vttFiles.find(
-      (f) => f.Name.replace(/\.vtt$/i, "") === baseName
-    );
-    const partialMatch = vttFiles.find(
-      (f) => f.Name.includes(baseName) || baseName.includes(f.Name.replace(/\.vtt$/i, ""))
-    );
-    const targetFile = exactMatch ?? partialMatch ?? vttFiles[0];
-
-    console.error(`[playwright] Using VTT file: ${targetFile.Name}`);
-
-    // Step 6: Download the VTT content via authenticated fetch in browser context
-    const vttUrl = `https://${info.hostname}${targetFile.ServerRelativeUrl}`;
-    const vttContent = await page.evaluate(async (url: string) => {
-      try {
-        const resp = await fetch(url, { credentials: "include" });
-        if (!resp.ok) return { ok: false, status: resp.status, text: "" };
-        const text = await resp.text();
-        return { ok: true, status: resp.status, text };
-      } catch (e) {
-        return { ok: false, status: 0, text: "", error: String(e) };
-      }
-    }, vttUrl);
-
-    if (!vttContent.ok || !vttContent.text.includes("WEBVTT")) {
-      console.error(
-        `[playwright] VTT download failed (HTTP ${vttContent.status}) or content is not VTT`
-      );
-      return null;
-    }
-
-    const destPath = path.join(destDir, targetFile.Name);
-    fs.writeFileSync(destPath, vttContent.text, "utf-8");
-    console.error(`[playwright] ✅ Transcript downloaded: ${targetFile.Name}`);
-    return destPath;
-
+    const data = await apiResp.json() as Record<string, unknown>;
+    const d = data?.d as Record<string, unknown> | undefined;
+    return (d?.results ?? []) as SharePointFile[];
   } finally {
     await browser.close();
   }
